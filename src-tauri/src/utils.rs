@@ -27,6 +27,19 @@ pub(crate) fn truncate_for_error(value: &str, max_len: usize) -> String {
     }
 }
 
+pub(crate) fn private_create_new_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    options
+}
+
 pub(crate) fn set_private_permissions(path: &Path) {
     let _ = try_set_private_permissions(path);
 }
@@ -380,6 +393,30 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
+        let _ = fs::remove_dir_all(&sandbox);
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_create_new_options_starts_files_owner_only() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let sandbox = unique_test_dir("private-create");
+        fs::create_dir_all(&sandbox).expect("create sandbox");
+        let path = sandbox.join("secret.txt");
+        let mut file = private_create_new_options()
+            .open(&path)
+            .expect("create private file");
+        file.write_all(b"secret").expect("write secret");
+
+        let mode = fs::metadata(&path)
+            .expect("read file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        drop(file);
         let _ = fs::remove_dir_all(&sandbox);
         assert_eq!(mode, 0o600);
     }

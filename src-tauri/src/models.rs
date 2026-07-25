@@ -1366,10 +1366,6 @@ mod tests {
         }))
         .expect("deserialize settings");
 
-        assert_eq!(
-            settings.proxy_url.as_deref(),
-            Some("http://127.0.0.1:7890")
-        );
+        assert_eq!(settings.proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
     }
-
 }

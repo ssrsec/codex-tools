@@ -93,6 +93,7 @@ use crate::store::save_store_to_path;
 use crate::store::update_account_group_refresh_state_in_path;
 use crate::usage::resolve_chatgpt_base_origin;
 use crate::utils::now_unix_seconds;
+use crate::utils::private_create_new_options;
 use crate::utils::set_private_permissions;
 use crate::utils::truncate_for_error;
 
@@ -5229,7 +5230,9 @@ fn read_authorized_api_proxy_key(
     let token = api_proxy_request_token(headers)?;
     let keys = api_keys.read().ok()?;
     keys.iter()
-        .find(|key| key.enabled && key.key == token)
+        .find(|key| {
+            key.enabled && constant_time_eq::constant_time_eq(key.key.as_bytes(), token.as_bytes())
+        })
         .cloned()
 }
 
@@ -5723,9 +5726,7 @@ fn write_private_named_file_atomically(
     ));
 
     let write_result = (|| -> Result<(), String> {
-        let mut temp_file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
+        let mut temp_file = private_create_new_options()
             .open(&temp_path)
             .map_err(|error| {
                 format!(

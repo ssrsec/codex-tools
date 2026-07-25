@@ -70,7 +70,10 @@ daemon 会在 `data-dir` 下维护：
 
 - `data_dir=...`
 - `listen=http://HOST:PORT/v1`
-- `api_key=sk-...`
+- `api_key_preview=sk-.....`
+
+为避免完整 Key 进入终端日志或 systemd journal，启动输出只显示前 8 个字符。
+需要查看完整 Key 时，请直接读取数据目录中的 `api-proxy.key`。
 
 ## 停止
 

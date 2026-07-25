@@ -309,8 +309,7 @@ mod tests {
     #[test]
     fn normalize_proxy_url_treats_blank_as_cleared() {
         assert_eq!(
-            normalize_proxy_url_for_storage(Some("   ".to_string()))
-                .expect("normalize proxy"),
+            normalize_proxy_url_for_storage(Some("   ".to_string())).expect("normalize proxy"),
             None
         );
         assert_eq!(
@@ -330,9 +329,8 @@ mod tests {
 
     #[test]
     fn normalize_proxy_url_rejects_unsupported_scheme() {
-        let error =
-            normalize_proxy_url_for_storage(Some("ftp://127.0.0.1:21".to_string()))
-                .expect_err("reject proxy");
+        let error = normalize_proxy_url_for_storage(Some("ftp://127.0.0.1:21".to_string()))
+            .expect_err("reject proxy");
 
         assert!(error.contains("HTTP、HTTPS 或 SOCKS"));
     }

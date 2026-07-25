@@ -21,6 +21,7 @@ use crate::models::AccountsStore;
 use crate::models::StoredAccount;
 use crate::profile_files;
 use crate::utils::now_unix_seconds;
+use crate::utils::private_create_new_options;
 use crate::utils::set_private_permissions;
 use crate::utils::short_account;
 
@@ -404,9 +405,7 @@ fn write_file_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
     ));
 
     let write_result = (|| -> Result<(), String> {
-        let mut temp_file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
+        let mut temp_file = private_create_new_options()
             .open(&temp_path)
             .map_err(|e| format!("创建临时存储文件失败 {}: {e}", temp_path.display()))?;
         temp_file
@@ -474,14 +473,29 @@ fn write_store_shadow_backups(path: &Path, contents: &[u8]) -> Result<(), String
     if latest_backup.exists() {
         let latest_contents = fs::read(&latest_backup)
             .map_err(|e| format!("读取最新备份失败 {}: {e}", latest_backup.display()))?;
-        fs::write(&previous_backup, latest_contents)
+        write_private_file(&previous_backup, &latest_contents)
             .map_err(|e| format!("写入上一个备份失败 {}: {e}", previous_backup.display()))?;
-        set_private_permissions(&previous_backup);
     }
 
-    fs::write(&latest_backup, contents)
+    write_private_file(&latest_backup, contents)
         .map_err(|e| format!("写入最新备份失败 {}: {e}", latest_backup.display()))?;
-    set_private_permissions(&latest_backup);
+    Ok(())
+}
+
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    set_private_permissions(path);
     Ok(())
 }
 
@@ -636,9 +650,8 @@ fn backup_corrupted_store_file(path: &Path, raw: &str) -> Result<PathBuf, String
         .map_err(|e| format!("创建存储目录失败 {}: {e}", parent.display()))?;
 
     let backup_path = parent.join(format!("accounts.corrupt-{}.json", now_unix_seconds()));
-    fs::write(&backup_path, raw)
+    write_private_file(&backup_path, raw.as_bytes())
         .map_err(|e| format!("写入损坏备份文件失败 {}: {e}", backup_path.display()))?;
-    set_private_permissions(&backup_path);
     Ok(backup_path)
 }
 

@@ -22,6 +22,7 @@ use crate::utils::new_background_command;
 use crate::utils::new_resolved_command;
 use crate::utils::now_unix_seconds;
 use crate::utils::prepend_path_entry;
+use crate::utils::private_create_new_options;
 use crate::utils::try_set_private_permissions;
 
 const REMOTE_BINARY_NAME: &str = "codex-tools-proxyd";
@@ -1603,13 +1604,26 @@ impl PreparedAuth {
                     .as_deref()
                     .ok_or_else(|| "SSH 私钥内容不能为空".to_string())?;
                 let temp_path = env::temp_dir().join(format!(
-                    "codex-tools-key-{}-{}.pem",
+                    "codex-tools-key-{}-{}-{}.pem",
                     sanitize_service_fragment(&server.id),
-                    now_unix_seconds()
+                    now_unix_seconds(),
+                    uuid::Uuid::new_v4()
                 ));
-                fs::write(&temp_path, private_key).map_err(|error| {
-                    format!("写入临时 SSH 私钥文件失败 {}: {error}", temp_path.display())
-                })?;
+                {
+                    use std::io::Write as _;
+                    let mut file =
+                        private_create_new_options()
+                            .open(&temp_path)
+                            .map_err(|error| {
+                                format!(
+                                    "创建临时 SSH 私钥文件失败 {}: {error}",
+                                    temp_path.display()
+                                )
+                            })?;
+                    file.write_all(private_key.as_bytes()).map_err(|error| {
+                        format!("写入临时 SSH 私钥文件失败 {}: {error}", temp_path.display())
+                    })?;
+                }
                 try_set_private_permissions(&temp_path).map_err(|error| {
                     format!(
                         "设置临时 SSH 私钥文件权限失败 {}: {error}",

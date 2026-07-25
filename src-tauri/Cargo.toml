@@ -38,6 +38,7 @@ uuid = { version = "1", features = ["v4"] }
 dirs = "6"
 base64 = "0.22"
 sha2 = "0.10"
+constant_time_eq = "0.3"
 time = { version = "0.3", features = ["formatting", "local-offset", "parsing"] }
 clap = { version = "4.5", features = ["derive"] }
 tauri-plugin-process = "2"
