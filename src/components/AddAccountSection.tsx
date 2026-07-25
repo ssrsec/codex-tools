@@ -1,3 +1,5 @@
+import { useState } from "react";
+import { createPortal } from "react-dom";
 import { useI18n } from "../i18n/I18nProvider";
 
 type AddAccountSectionProps = {
@@ -52,37 +54,112 @@ export function AddAccountSection({
   cleanupUnavailableCount,
 }: AddAccountSectionProps) {
   const { copy } = useI18n();
+  const [cleanupConfirmationOpen, setCleanupConfirmationOpen] = useState(false);
+
+  const handleCleanupClick = () => {
+    if (cleanupUnavailableCount === 0) {
+      onCleanupUnavailable();
+      return;
+    }
+    setCleanupConfirmationOpen(true);
+  };
+
+  const cleanupConfirmation =
+    cleanupConfirmationOpen && cleanupUnavailableCount > 0
+      ? createPortal(
+          <div
+            className="settingsOverlay"
+            role="presentation"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget && !cleaningUnavailable) {
+                setCleanupConfirmationOpen(false);
+              }
+            }}
+          >
+            <div
+              className="settingsDialog deleteAccountDialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="cleanup-unavailable-title"
+            >
+              <div className="deleteAccountDialogIcon" aria-hidden="true">
+                <CleanupIcon />
+              </div>
+              <div className="deleteAccountDialogBody">
+                <h2 id="cleanup-unavailable-title">
+                  {copy.addAccount.cleanupUnavailable}
+                </h2>
+                <p>
+                  {copy.notices.cleanupUnavailableConfirm(
+                    cleanupUnavailableCount,
+                  )}
+                </p>
+              </div>
+              <div className="deleteAccountDialogActions">
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => setCleanupConfirmationOpen(false)}
+                  disabled={cleaningUnavailable}
+                >
+                  {copy.accountDeleteDialog.cancel}
+                </button>
+                <button
+                  type="button"
+                  className="danger"
+                  onClick={() => {
+                    setCleanupConfirmationOpen(false);
+                    onCleanupUnavailable();
+                  }}
+                  disabled={cleaningUnavailable}
+                >
+                  {cleaningUnavailable
+                    ? copy.accountDeleteDialog.deleting
+                    : copy.accountDeleteDialog.confirm}
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )
+      : null;
 
   return (
-    <section className="importBar">
-      <button
-        className="ghost dangerTextButton importCleanup"
-        onClick={onCleanupUnavailable}
-        disabled={cleaningUnavailable || cleanupUnavailableCount === 0}
-        title={`${copy.addAccount.cleanupUnavailable} (${cleanupUnavailableCount})`}
-      >
-        <CleanupIcon />
-        {cleaningUnavailable
-          ? copy.addAccount.cleaningUnavailable
-          : `${copy.addAccount.cleanupUnavailable} (${cleanupUnavailableCount})`}
-      </button>
-      <button
-        className="ghost smartSwitchButton importSmartSwitch"
-        onClick={onSmartSwitch}
-        disabled={smartSwitching}
-        title={copy.addAccount.smartSwitch}
-        aria-label={copy.addAccount.smartSwitch}
-      >
-        <SparkIcon />
-        {copy.addAccount.smartSwitch}
-      </button>
-      <button
-        className="primary importPrimary"
-        onClick={onOpenAddDialog}
-      >
-        <PlusIcon />
-        {copy.addAccount.startButton}
-      </button>
-    </section>
+    <>
+      <section className="importBar">
+        <button
+          type="button"
+          className="ghost dangerTextButton importCleanup"
+          onClick={handleCleanupClick}
+          disabled={cleaningUnavailable}
+          title={`${copy.addAccount.cleanupUnavailable} (${cleanupUnavailableCount})`}
+        >
+          <CleanupIcon />
+          {cleaningUnavailable
+            ? copy.addAccount.cleaningUnavailable
+            : `${copy.addAccount.cleanupUnavailable} (${cleanupUnavailableCount})`}
+        </button>
+        <button
+          type="button"
+          className="ghost smartSwitchButton importSmartSwitch"
+          onClick={onSmartSwitch}
+          disabled={smartSwitching}
+          title={copy.addAccount.smartSwitch}
+          aria-label={copy.addAccount.smartSwitch}
+        >
+          <SparkIcon />
+          {copy.addAccount.smartSwitch}
+        </button>
+        <button
+          type="button"
+          className="primary importPrimary"
+          onClick={onOpenAddDialog}
+        >
+          <PlusIcon />
+          {copy.addAccount.startButton}
+        </button>
+      </section>
+      {cleanupConfirmation}
+    </>
   );
 }

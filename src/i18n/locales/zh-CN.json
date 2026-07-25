@@ -609,7 +609,7 @@
     "testAccountFailed": "检测账号状态失败：{{error}}",
     "cleanupUnavailableConfirm": "确定删除 {{count}} 个明确不可用的账号吗？当前正在使用的账号不会被删除。",
     "cleanupUnavailableDone": "已清理 {{count}} 个不可用账号，跳过当前账号 {{skipped}} 个。",
-    "cleanupUnavailableEmpty": "没有可安全清理的不可用账号。",
+    "cleanupUnavailableEmpty": "没有可安全清理的不可用账号。当前账号、额度耗尽和仅检测失败的账号会保留。",
     "cleanupUnavailableFailed": "清理不可用账号失败：{{error}}",
     "accountAlreadyCurrent": "已是当前账号，无需切换。",
     "switchedOnly": "账号已切换（未自动启动 Codex）。",

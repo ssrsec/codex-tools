@@ -2418,15 +2418,6 @@ export function useCodexController() {
       });
       return;
     }
-    if (
-      typeof window !== "undefined" &&
-      !window.confirm(
-        copy.notices.cleanupUnavailableConfirm(cleanupUnavailableCount),
-      )
-    ) {
-      return;
-    }
-
     setCleaningUnavailableAccounts(true);
     try {
       const result = await invoke<CleanupUnusableAccountsResult>(
