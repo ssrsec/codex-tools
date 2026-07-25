@@ -2,8 +2,7 @@
   <h1>Codex Tools</h1>
   <p><strong>Codex 多账号管理、CLI/TUI 切换、用量查看和本地 OpenAI 兼容 API 反代工具。</strong></p>
   <p>
-    <a href="https://github.com/ssrsec/codex-tools/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/ssrsec/codex-tools?label=release"></a>
-    <a href="https://www.npmjs.com/package/@ssrsec/ctc"><img alt="npm" src="https://img.shields.io/npm/v/@ssrsec/ctc?label=npm"></a>
+    <a href="https://github.com/ssrsec/codex-tools/releases"><img alt="Latest version" src="https://img.shields.io/github/v/tag/ssrsec/codex-tools?label=version"></a>
     <a href="https://github.com/ssrsec/codex-tools/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue"></a>
     <img alt="Platforms" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey">
   </p>
@@ -47,7 +46,7 @@ Codex Tools 面向同时使用多个 Codex 账号的场景，提供桌面 GUI、
 
 ### CLI/TUI
 
-推荐通过 npm 安装命令行入口：
+`@ssrsec/ctc` 首次发布到 npm 后，可以通过 npm 安装命令行入口：
 
 ```bash
 npm i -g @ssrsec/ctc
