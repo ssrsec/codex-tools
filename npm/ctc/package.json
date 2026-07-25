@@ -1,15 +1,15 @@
 {
-  "name": "@170-carry/ctc",
+  "name": "@ssrsec/ctc",
   "version": "2.4.0",
   "description": "Codex Tools command launcher",
   "license": "MIT",
-  "homepage": "https://github.com/170-carry/codex-tools",
+  "homepage": "https://github.com/ssrsec/codex-tools",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/170-carry/codex-tools.git"
+    "url": "git+https://github.com/ssrsec/codex-tools.git"
   },
   "bugs": {
-    "url": "https://github.com/170-carry/codex-tools/issues"
+    "url": "https://github.com/ssrsec/codex-tools/issues"
   },
   "publishConfig": {
     "access": "public"
@@ -25,8 +25,8 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@170-carry/ctc-darwin-arm64": "2.4.0",
-    "@170-carry/ctc-darwin-x64": "2.4.0",
-    "@170-carry/ctc-win32-x64": "2.4.0"
+    "@ssrsec/ctc-darwin-arm64": "2.4.0",
+    "@ssrsec/ctc-darwin-x64": "2.4.0",
+    "@ssrsec/ctc-win32-x64": "2.4.0"
   }
 }

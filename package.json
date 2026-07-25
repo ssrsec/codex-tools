@@ -3,13 +3,13 @@
   "private": true,
   "version": "2.4.0",
   "license": "MIT",
-  "homepage": "https://github.com/170-carry/codex-tools",
+  "homepage": "https://github.com/ssrsec/codex-tools",
   "bugs": {
-    "url": "https://github.com/170-carry/codex-tools/issues"
+    "url": "https://github.com/ssrsec/codex-tools/issues"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/170-carry/codex-tools.git"
+    "url": "https://github.com/ssrsec/codex-tools.git"
   },
   "type": "module",
   "scripts": {
@@ -24,8 +24,6 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",
-    "@tauri-apps/plugin-process": "^2.3.1",
-    "@tauri-apps/plugin-updater": "^2.10.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },

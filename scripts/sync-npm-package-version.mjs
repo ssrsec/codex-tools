@@ -13,7 +13,7 @@ const packageDirs = fs
   .sort();
 const nativePackages = packageDirs
   .filter((name) => name !== "ctc")
-  .map((name) => `@170-carry/${name}`)
+  .map((name) => `@ssrsec/${name}`)
   .sort();
 
 for (const dir of packageDirs) {
@@ -21,7 +21,7 @@ for (const dir of packageDirs) {
   const packageJson = JSON.parse(fs.readFileSync(packagePath, "utf8"));
   packageJson.version = rootPackage.version;
 
-  if (packageJson.name === "@170-carry/ctc") {
+  if (packageJson.name === "@ssrsec/ctc") {
     packageJson.optionalDependencies = Object.fromEntries(
       nativePackages.map((packageName) => [packageName, rootPackage.version]),
     );

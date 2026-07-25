@@ -1,9 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { check } from "@tauri-apps/plugin-updater";
-import { PROJECT_LATEST_RELEASE_URL } from "../constants/externalLinks";
 import { useI18n } from "../i18n/I18nProvider";
 import { localizeBackendError } from "../i18n/backendErrors";
 import { DEFAULT_LOCALE } from "../i18n/catalog";
@@ -19,6 +16,7 @@ import type {
   AppSettings,
   AuthJsonImportInput,
   CloudflaredStatus,
+  CleanupUnusableAccountsResult,
   CodexCostAnalyticsProgress,
   CodexCostAnalyticsSnapshot,
   CodexTokenUsageSnapshot,
@@ -29,7 +27,6 @@ import type {
   InstalledEditorApp,
   Notice,
   OauthCallbackFinishedEvent,
-  PendingUpdateInfo,
   PreparedOauthLogin,
   RemoteDeployProgress,
   RemoteProxyStatus,
@@ -38,6 +35,7 @@ import type {
   SwitchAccountResult,
   TestApiAccountConnectionInput,
   TestApiAccountConnectionResult,
+  TestAccountStatusResult,
   UpdateApiProxyKeyInput,
   UpdateSettingsOptions,
 } from "../types/app";
@@ -45,15 +43,11 @@ import {
   pickBestSmartSwitchAccount,
   sortAccountsByRemaining,
 } from "../utils/accountRanking";
-import {
-  getLatestChangelogEntry,
-  getUnreleasedChangelogEntry,
-} from "../utils/changelog";
+import { accountCanBeCleaned } from "../utils/accountStatus";
 
 const REFRESH_MS = 30_000;
 const COST_ANALYTICS_REFRESH_MS = 60_000;
 const EDITOR_SCAN_MS = 60_000;
-const UPDATE_CHECK_MS = 60 * 60 * 1000;
 const API_PROXY_POLL_MS = 4_000;
 const API_PROXY_USAGE_POLL_MS = 2_000;
 const CLOUDFLARED_POLL_MS = 3_000;
@@ -85,10 +79,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   apiProxyLoadBalanceMode: "average",
   apiProxySequentialFiveHourLimitPercent: 80,
   apiProxyDisabledModels: [],
-  codexAnalyticsWeeklyBudgetUsd: null,
   remoteServers: [],
   locale: DEFAULT_LOCALE,
-  skippedUpdateVersion: null,
 };
 const DEFAULT_API_PROXY_STATUS: ApiProxyStatus = {
   running: false,
@@ -286,6 +278,9 @@ export function useCodexController() {
   const [startingCloudflared, setStartingCloudflared] = useState(false);
   const [stoppingCloudflared, setStoppingCloudflared] = useState(false);
   const [switchingId, setSwitchingId] = useState<string | null>(null);
+  const [testingAccountId, setTestingAccountId] = useState<string | null>(null);
+  const [cleaningUnavailableAccounts, setCleaningUnavailableAccounts] =
+    useState(false);
   const [renamingAccountId, setRenamingAccountId] = useState<string | null>(
     null,
   );
@@ -295,13 +290,6 @@ export function useCodexController() {
   const [deletingAccountId, setDeletingAccountId] = useState<string | null>(
     null,
   );
-  const [checkingUpdate, setCheckingUpdate] = useState(false);
-  const [installingUpdate, setInstallingUpdate] = useState(false);
-  const [updateProgress, setUpdateProgress] = useState<string | null>(null);
-  const [pendingUpdate, setPendingUpdate] = useState<PendingUpdateInfo | null>(
-    null,
-  );
-  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
@@ -310,7 +298,6 @@ export function useCodexController() {
     InstalledEditorApp[]
   >([]);
   const [hasOpencodeDesktopApp, setHasOpencodeDesktopApp] = useState(false);
-  const installingUpdateRef = useRef(false);
   const settingsUpdateQueueRef = useRef<Promise<void>>(Promise.resolve());
   const settingsRef = useRef<AppSettings>(DEFAULT_SETTINGS);
   const apiProxyUsageLoadSeqRef = useRef(0);
@@ -329,6 +316,21 @@ export function useCodexController() {
   );
   const authBusy =
     importingAccounts || oauthWaitingForCallback || switchingId !== null;
+  const cleanupUnavailableCount = useMemo(
+    () => {
+      const currentAccountKeys = new Set(
+        sortedAccounts
+          .filter((account) => account.isCurrent)
+          .map((account) => account.accountKey),
+      );
+      return sortedAccounts.filter(
+        (account) =>
+          !currentAccountKeys.has(account.accountKey) &&
+          accountCanBeCleaned(account),
+      ).length;
+    },
+    [sortedAccounts],
+  );
 
   const localizeError = useCallback(
     (error: string) => localizeBackendError(error, locale),
@@ -890,10 +892,6 @@ export function useCodexController() {
   );
 
   useEffect(() => {
-    installingUpdateRef.current = installingUpdate;
-  }, [installingUpdate]);
-
-  useEffect(() => {
     if (!notice) {
       return;
     }
@@ -905,143 +903,6 @@ export function useCodexController() {
       window.clearTimeout(timer);
     };
   }, [notice]);
-
-  const installPendingUpdate = useCallback(
-    async (knownUpdate?: NonNullable<Awaited<ReturnType<typeof check>>>) => {
-      if (installingUpdateRef.current) {
-        return;
-      }
-
-      if (!knownUpdate && pendingUpdate?.debugPreview) {
-        setPendingUpdate(null);
-        setUpdateProgress(null);
-        setUpdateDialogOpen(false);
-        return;
-      }
-
-      setInstallingUpdate(true);
-      setUpdateProgress(copy.notices.preparingUpdateDownload);
-      try {
-        const update = knownUpdate ?? (await check());
-        if (!update) {
-          setPendingUpdate(null);
-          setUpdateDialogOpen(false);
-          setNotice({ type: "ok", message: copy.notices.alreadyLatest });
-          return;
-        }
-
-        let totalBytes = 0;
-        let downloadedBytes = 0;
-        await update.downloadAndInstall((event) => {
-          if (event.event === "Started") {
-            totalBytes = event.data.contentLength ?? 0;
-            downloadedBytes = 0;
-            setUpdateProgress(copy.notices.updateDownloadStarted);
-          } else if (event.event === "Progress") {
-            downloadedBytes += event.data.chunkLength;
-            if (totalBytes > 0) {
-              const percentValue = Math.min(
-                100,
-                Math.round((downloadedBytes / totalBytes) * 100),
-              );
-              setUpdateProgress(
-                copy.notices.updateDownloadingPercent(percentValue),
-              );
-            } else {
-              setUpdateProgress(copy.notices.updateDownloading);
-            }
-          } else if (event.event === "Finished") {
-            setUpdateProgress(copy.notices.updateDownloadFinished);
-          }
-        });
-
-        setUpdateProgress(copy.notices.updateInstalling);
-        await relaunch();
-      } catch (error) {
-        setNotice({
-          type: "error",
-          message: copy.notices.updateInstallFailed(
-            localizeError(String(error)),
-          ),
-        });
-        setUpdateProgress(null);
-      } finally {
-        setInstallingUpdate(false);
-      }
-    },
-    [copy.notices, localizeError, pendingUpdate?.debugPreview],
-  );
-
-  const checkForAppUpdate = useCallback(
-    async (quiet = false) => {
-      if (!quiet) {
-        setCheckingUpdate(true);
-      }
-      try {
-        const update = await check();
-        if (update) {
-          if (
-            quiet &&
-            settingsRef.current.skippedUpdateVersion === update.version
-          ) {
-            return;
-          }
-
-          setUpdateProgress(null);
-          setPendingUpdate({
-            currentVersion: update.currentVersion,
-            version: update.version,
-            body: update.body,
-            date: update.date,
-          });
-          setUpdateDialogOpen(true);
-          if (!quiet) {
-            setNotice({
-              type: "info",
-              message: copy.notices.foundNewVersion(
-                update.version,
-                update.currentVersion,
-              ),
-            });
-          }
-        } else {
-          setPendingUpdate(null);
-          setUpdateDialogOpen(false);
-          setUpdateProgress(null);
-          if (!quiet) {
-            setNotice({ type: "ok", message: copy.notices.alreadyLatest });
-          }
-        }
-      } catch (error) {
-        if (!quiet) {
-          setNotice({
-            type: "error",
-            message: copy.notices.updateCheckFailed(
-              localizeError(String(error)),
-            ),
-          });
-        }
-      } finally {
-        if (!quiet) {
-          setCheckingUpdate(false);
-        }
-      }
-    },
-    [copy.notices, localizeError],
-  );
-
-  const openManualDownloadPage = useCallback(async () => {
-    try {
-      await invoke("open_external_url", { url: PROJECT_LATEST_RELEASE_URL });
-    } catch (error) {
-      setNotice({
-        type: "error",
-        message: copy.notices.openManualDownloadFailed(
-          localizeError(String(error)),
-        ),
-      });
-    }
-  }, [copy.notices, localizeError]);
 
   const openExternalUrl = useCallback(
     async (url: string) => {
@@ -1058,29 +919,6 @@ export function useCodexController() {
     },
     [copy.notices, localizeError],
   );
-
-  const closeUpdateDialog = useCallback(() => {
-    setUpdateDialogOpen(false);
-  }, []);
-
-  const openDebugUpdateDialog = useCallback(() => {
-    const latestChangelogEntry =
-      getUnreleasedChangelogEntry(locale) ?? getLatestChangelogEntry(locale);
-    const version = latestChangelogEntry?.version ?? "0.0.0";
-    const body = latestChangelogEntry?.items
-      .map((item, index) => `${index + 1}. ${item}`)
-      .join("\n");
-
-    setUpdateProgress(null);
-    setPendingUpdate({
-      currentVersion: "debug-local",
-      version,
-      body,
-      date: new Date().toISOString().slice(0, 10),
-      debugPreview: true,
-    });
-    setUpdateDialogOpen(true);
-  }, [locale]);
 
   useEffect(() => {
     let disposed = false;
@@ -1107,25 +945,6 @@ export function useCodexController() {
       }
     };
   }, []);
-
-  const skipPendingUpdateVersion = useCallback(async () => {
-    if (!pendingUpdate) {
-      return;
-    }
-
-    setPendingUpdate(null);
-    setUpdateProgress(null);
-    setUpdateDialogOpen(false);
-
-    if (pendingUpdate.debugPreview) {
-      return;
-    }
-
-    await updateSettings(
-      { skippedUpdateVersion: pendingUpdate.version },
-      { silent: true, keepInteractive: true },
-    );
-  }, [pendingUpdate, updateSettings]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1161,7 +980,6 @@ export function useCodexController() {
         refreshUsage(true, true, true),
         refreshTokenUsage(true),
         loadCostAnalytics(true),
-        settingsTask.then(() => checkForAppUpdate(true)),
       ]);
     };
 
@@ -1171,7 +989,6 @@ export function useCodexController() {
       cancelled = true;
     };
   }, [
-    checkForAppUpdate,
     loadAccounts,
     loadApiProxyKeyLogs,
     loadApiProxyKeys,
@@ -1202,17 +1019,11 @@ export function useCodexController() {
       void loadOpencodeDesktopAppInstalled();
     }, EDITOR_SCAN_MS);
 
-    const updateTimer = setInterval(() => {
-      void checkForAppUpdate(true);
-    }, UPDATE_CHECK_MS);
-
     return () => {
       clearInterval(usageTimer);
       clearInterval(editorTimer);
-      clearInterval(updateTimer);
     };
   }, [
-    checkForAppUpdate,
     loadInstalledEditorApps,
     loadOpencodeDesktopAppInstalled,
     mainWindowVisible,
@@ -2561,6 +2372,95 @@ export function useCodexController() {
     [copy.notices],
   );
 
+  const onTestAccountStatus = useCallback(
+    async (account: AccountSummary) => {
+      if (testingAccountId !== null) {
+        return;
+      }
+      setTestingAccountId(account.id);
+      try {
+        const result = await invoke<TestAccountStatusResult>(
+          "test_account_status",
+          { id: account.id },
+        );
+        await loadAccounts();
+        setNotice({
+          type: result.ok ? "ok" : "error",
+          message: result.ok
+            ? copy.notices.testAccountHealthy(result.account.label)
+            : copy.notices.testAccountUnavailable(
+                result.account.label,
+                localizeError(result.message),
+              ),
+        });
+      } catch (error) {
+        setNotice({
+          type: "error",
+          message: copy.notices.testAccountFailed(
+            localizeError(String(error)),
+          ),
+        });
+      } finally {
+        setTestingAccountId(null);
+      }
+    },
+    [copy.notices, loadAccounts, localizeError, testingAccountId],
+  );
+
+  const onCleanupUnavailableAccounts = useCallback(async () => {
+    if (cleaningUnavailableAccounts) {
+      return;
+    }
+    if (cleanupUnavailableCount === 0) {
+      setNotice({
+        type: "info",
+        message: copy.notices.cleanupUnavailableEmpty,
+      });
+      return;
+    }
+    if (
+      typeof window !== "undefined" &&
+      !window.confirm(
+        copy.notices.cleanupUnavailableConfirm(cleanupUnavailableCount),
+      )
+    ) {
+      return;
+    }
+
+    setCleaningUnavailableAccounts(true);
+    try {
+      const result = await invoke<CleanupUnusableAccountsResult>(
+        "cleanup_unusable_accounts",
+      );
+      await loadAccounts();
+      setNotice({
+        type: result.deletedCount > 0 ? "ok" : "info",
+        message:
+          result.deletedCount > 0 || result.skippedCurrentCount > 0
+            ? copy.notices.cleanupUnavailableDone(
+                result.deletedCount,
+                result.skippedCurrentCount,
+              )
+            : copy.notices.cleanupUnavailableEmpty,
+      });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        message: copy.notices.cleanupUnavailableFailed(
+          localizeError(String(error)),
+        ),
+      });
+    } finally {
+      setCleaningUnavailableAccounts(false);
+    }
+  }, [
+    cleaningUnavailableAccounts,
+    cleanupUnavailableCount,
+    copy.notices,
+    loadAccounts,
+    localizeError,
+  ]);
+
   const onCancelDelete = useCallback(() => {
     if (deletingAccountId !== null) {
       return;
@@ -2851,16 +2751,13 @@ export function useCodexController() {
     startingCloudflared,
     stoppingCloudflared,
     switchingId,
+    testingAccountId,
+    cleaningUnavailableAccounts,
+    cleanupUnavailableCount,
     renamingAccountId,
     pendingDeleteId: deleteCandidate?.id ?? null,
     deleteCandidate,
     deletingAccountId,
-    checkingUpdate,
-    installingUpdate,
-    updateProgress,
-    pendingUpdate,
-    updateDialogOpen,
-    skipPendingUpdateVersion,
     notice,
     openExternalUrl,
     settings,
@@ -2876,11 +2773,6 @@ export function useCodexController() {
     refreshCostAnalytics,
     exportCostAnalytics,
     onDeleteCodexSession,
-    checkForAppUpdate,
-    installPendingUpdate,
-    openDebugUpdateDialog,
-    openManualDownloadPage,
-    closeUpdateDialog,
     updateSettings,
     onOpenAddDialog,
     onReauthorizeAccount,
@@ -2920,6 +2812,8 @@ export function useCodexController() {
     onRenameAccountLabel,
     onToggleAccountApiProxy,
     onDelete,
+    onTestAccountStatus,
+    onCleanupUnavailableAccounts,
     onCancelDelete,
     onConfirmDelete,
     onSwitch,

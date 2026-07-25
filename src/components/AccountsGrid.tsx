@@ -2,6 +2,7 @@ import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import type { AccountSummary, CodexTokenUsageSnapshot, UsageWindow } from "../types/app";
 import { useI18n } from "../i18n/I18nProvider";
 import { compareAccountsByRemaining } from "../utils/accountRanking";
+import { getAccountStatus, type AccountStatus } from "../utils/accountStatus";
 import { classifyUsageRefreshError } from "../utils/usageRefreshError";
 import {
   formatPlan,
@@ -21,14 +22,6 @@ type AccountRow = AccountGroup & {
   account: AccountSummary;
 };
 
-type SwitchRecord = {
-  id: string;
-  target: string;
-  source: string;
-  timestamp: number;
-};
-
-type AccountStatus = "using" | "available" | "low" | "exhausted" | "issue";
 type StatusFilter = AccountStatus | "all";
 
 type UiCopy = {
@@ -40,36 +33,26 @@ type UiCopy = {
   statusAvailable: string;
   statusLow: string;
   statusExhausted: string;
+  statusCheckFailed: string;
   statusIssue: string;
   issueFallbackReason: string;
   tokenUsageTitle: string;
+  tokenUsageHint: string;
   tokenUsageError: string;
-  detailsTitle: string;
-  usageOverview: string;
-  fiveHourUsage: string;
   weekUsage: string;
   remainingSuffix: (value: string) => string;
-  resetTime: string;
-  membershipPeriodEnds: string;
-  resetCreditsTitle: string;
-  resetCreditsAvailable: (count: number | null) => string;
-  resetCreditsExpiresAt: string;
-  resetCreditsExpand: (hiddenCount: number) => string;
-  resetCreditsCollapse: string;
-  planType: string;
-  recentSwitches: string;
-  switchRecordAction: string;
-  noSwitchRecords: string;
-  fromPrefix: string;
+  subscriptionExpiry: string;
+  subscriptionUnavailable: string;
+  subscriptionUnavailableHint: string;
+  nextResetTime: string;
   quickActions: string;
+  testStatus: string;
+  testingStatus: string;
   reauthorize: string;
   exportAccount: string;
   exportAll: string;
   deleteAccount: string;
   switchAccount: string;
-  edit: string;
-  save: string;
-  cancel: string;
   noMatchesTitle: string;
   noMatchesDescription: string;
   emptyValue: string;
@@ -88,12 +71,12 @@ type AccountsGridProps = {
   exportingAccounts: boolean;
   authBusy: boolean;
   switchingId: string | null;
-  renamingAccountId: string | null;
+  testingAccountId: string | null;
   pendingDeleteId: string | null;
   onExportAll: () => void;
   onExport: (account: AccountSummary) => void;
   onReauthorize: (account: AccountSummary) => void;
-  onRename: (account: AccountSummary, label: string) => Promise<boolean>;
+  onTestStatus: (account: AccountSummary) => Promise<void>;
   onToggleApiProxy: (account: AccountSummary, enabled: boolean) => Promise<boolean>;
   onSwitch: (account: AccountSummary) => Promise<boolean>;
   onDelete: (account: AccountSummary) => void;
@@ -130,21 +113,27 @@ function sortVariantsForGroup(left: AccountSummary, right: AccountSummary): numb
   return compareAccountsByRemaining(left, right);
 }
 
-function accountHasBlockingIssue(account: AccountSummary): boolean {
-  return Boolean(
-    account.authRefreshBlocked ||
-      account.profileIntegrityError ||
-      account.profileLastValidationError ||
-      account.authRefreshError,
+function accountIssueReason(
+  account: AccountSummary,
+  fallbackReason: string,
+  refreshError: string | null,
+): string | null {
+  const usageAuthorizationFailure = Boolean(
+    account.usageError &&
+      classifyUsageRefreshError(account.usageError) === "authorization",
   );
-}
-
-function accountIssueReason(account: AccountSummary, fallbackReason: string): string | null {
+  const isFreePlan =
+    account.sourceKind === "chatgpt" &&
+    (account.usage?.planType ?? account.planType ?? "").trim().toLowerCase() === "free";
   return (
     account.profileIntegrityError ||
     account.profileLastValidationError ||
     account.authRefreshError ||
-    (account.authRefreshBlocked ? fallbackReason : null)
+    account.usageError ||
+    refreshError ||
+    (account.authRefreshBlocked || usageAuthorizationFailure || isFreePlan
+      ? fallbackReason
+      : null)
   );
 }
 
@@ -153,40 +142,6 @@ function usedPercent(window: UsageWindow | null): number | null {
     return null;
   }
   return Math.max(0, Math.min(100, window.usedPercent));
-}
-
-function accountHasExhaustedWindow(account: AccountSummary): boolean {
-  return [account.usage?.fiveHour ?? null, account.usage?.oneWeek ?? null].some((window) => {
-    const remaining = remainingPercent(window);
-    return remaining !== null && remaining <= 0;
-  });
-}
-
-function lowestRemaining(account: AccountSummary): number | null {
-  const values = [remainingPercent(account.usage?.fiveHour ?? null), remainingPercent(account.usage?.oneWeek ?? null)]
-    .filter((value): value is number => value !== null && !Number.isNaN(value));
-  return values.length > 0 ? Math.min(...values) : null;
-}
-
-function accountStatus(account: AccountSummary): AccountStatus {
-  if (accountHasBlockingIssue(account)) {
-    return "issue";
-  }
-
-  if (accountHasExhaustedWindow(account)) {
-    return "exhausted";
-  }
-
-  const remaining = lowestRemaining(account);
-  if (remaining !== null && remaining < 15) {
-    return "low";
-  }
-
-  if (account.isCurrent) {
-    return "using";
-  }
-
-  return "available";
 }
 
 function getUiCopy(locale: string): UiCopy {
@@ -200,36 +155,27 @@ function getUiCopy(locale: string): UiCopy {
       statusAvailable: "可用",
       statusLow: "即将耗尽",
       statusExhausted: "已耗尽",
+      statusCheckFailed: "检测失败",
       statusIssue: "异常账号",
       issueFallbackReason: "查看账号授权和用量状态",
-      tokenUsageTitle: "Token 使用量",
+      tokenUsageTitle: "有效 Token",
+      tokenUsageHint: "仅统计主会话的非缓存输入与输出，不含子任务和缓存输入",
       tokenUsageError: "Token 用量读取失败",
-      detailsTitle: "详情",
-      usageOverview: "使用概览",
-      fiveHourUsage: "5小时使用率",
-      weekUsage: "周使用率",
+      weekUsage: "额度使用率",
       remainingSuffix: (value) => `剩余 ${value}`,
-      resetTime: "重置时间",
-      membershipPeriodEnds: "会员到期时间（仅供参考）",
-      resetCreditsTitle: "重置卡",
-      resetCreditsAvailable: (count) => (count === null ? "可用数量未知" : `可用 ${count} 张`),
-      resetCreditsExpiresAt: "过期时间（系统本地时间）",
-      resetCreditsExpand: (hiddenCount) => `展开 ${hiddenCount} 张`,
-      resetCreditsCollapse: "收起",
-      planType: "套餐类型",
-      recentSwitches: "最近切换记录",
-      switchRecordAction: "切换到此账号",
-      noSwitchRecords: "暂无切换记录",
-      fromPrefix: "从",
+      subscriptionExpiry: "订阅到期",
+      subscriptionUnavailable: "平台未提供",
+      subscriptionUnavailableHint:
+        "账号可用性来自用量接口；订阅到期日仅来自登录凭据，而此账号的凭据没有提供该字段。",
+      nextResetTime: "下次重置",
       quickActions: "快捷操作",
-      reauthorize: "测试登录",
+      testStatus: "检测账号状态",
+      testingStatus: "检测中…",
+      reauthorize: "重新登录授权",
       exportAccount: "导出账号",
       exportAll: "全部导出",
       deleteAccount: "删除账号",
       switchAccount: "切换",
-      edit: "编辑",
-      save: "保存",
-      cancel: "取消",
       noMatchesTitle: "没有匹配账号",
       noMatchesDescription: "调整搜索或筛选条件后再查看列表。",
       emptyValue: "--",
@@ -245,36 +191,27 @@ function getUiCopy(locale: string): UiCopy {
     statusAvailable: "Available",
     statusLow: "Low quota",
     statusExhausted: "Exhausted",
+    statusCheckFailed: "Check failed",
     statusIssue: "Needs attention",
     issueFallbackReason: "Check account auth and usage state",
-    tokenUsageTitle: "Token usage",
+    tokenUsageTitle: "Effective tokens",
+    tokenUsageHint: "Main sessions only: uncached input plus output; excludes child tasks and cached input",
     tokenUsageError: "Token usage unavailable",
-    detailsTitle: "Details",
-    usageOverview: "Usage overview",
-    fiveHourUsage: "5h usage",
-    weekUsage: "Weekly usage",
+    weekUsage: "Quota usage",
     remainingSuffix: (value) => `${value} remaining`,
-    resetTime: "Reset time",
-    membershipPeriodEnds: "Membership expiry (for reference only)",
-    resetCreditsTitle: "Reset cards",
-    resetCreditsAvailable: (count) => (count === null ? "Available count unknown" : `${count} available`),
-    resetCreditsExpiresAt: "Expires (system local time)",
-    resetCreditsExpand: (hiddenCount) => `Show ${hiddenCount} more`,
-    resetCreditsCollapse: "Show less",
-    planType: "Plan",
-    recentSwitches: "Recent switches",
-    switchRecordAction: "Switched to this account",
-    noSwitchRecords: "No switch records yet",
-    fromPrefix: "from",
+    subscriptionExpiry: "Subscription ends",
+    subscriptionUnavailable: "Not provided",
+    subscriptionUnavailableHint:
+      "Availability comes from the usage API. This account's sign-in credential does not provide a subscription end date.",
+    nextResetTime: "Next reset",
     quickActions: "Quick actions",
-    reauthorize: "Test login",
+    testStatus: "Check account status",
+    testingStatus: "Checking…",
+    reauthorize: "Reauthorize login",
     exportAccount: "Export account",
     exportAll: "Export all",
     deleteAccount: "Delete",
     switchAccount: "Switch",
-    edit: "Edit",
-    save: "Save",
-    cancel: "Cancel",
     noMatchesTitle: "No matching accounts",
     noMatchesDescription: "Change the search or filters to view accounts.",
     emptyValue: "--",
@@ -284,6 +221,7 @@ function getUiCopy(locale: string): UiCopy {
 function statusLabel(status: AccountStatus, text: UiCopy): string {
   if (status === "using") return text.statusUsing;
   if (status === "exhausted") return text.statusExhausted;
+  if (status === "checkFailed") return text.statusCheckFailed;
   if (status === "low") return text.statusLow;
   if (status === "issue") return text.statusIssue;
   return text.statusAvailable;
@@ -299,7 +237,7 @@ function displayAccountAddress(account: AccountSummary, emptyValue: string): str
   return account.email || account.accountId || account.apiBaseUrl || emptyValue;
 }
 
-function formatResetValue(epochSec: number | null | undefined, locale: string, emptyValue: string): string {
+function formatDateTime(epochSec: number | null | undefined, locale: string, emptyValue: string): string {
   if (!epochSec) {
     return emptyValue;
   }
@@ -312,18 +250,53 @@ function formatResetValue(epochSec: number | null | undefined, locale: string, e
   });
 }
 
-function formatFullDate(epochSec: number | null | undefined, locale: string, emptyValue: string): string {
+function formatSubscriptionExpiry(
+  epochSec: number | null | undefined,
+  locale: string,
+  emptyValue: string,
+): string {
   if (!epochSec) {
     return emptyValue;
   }
 
-  return new Date(epochSec * 1000).toLocaleString(locale, {
+  return new Date(epochSec * 1000).toLocaleDateString(locale, {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
   });
+}
+
+function subscriptionExpiryDisplay(
+  account: AccountSummary,
+  locale: string,
+  text: UiCopy,
+): { label: string; title?: string } {
+  if (account.subscriptionActiveUntil) {
+    return {
+      label: formatSubscriptionExpiry(
+        account.subscriptionActiveUntil,
+        locale,
+        text.emptyValue,
+      ),
+    };
+  }
+
+  if (account.sourceKind === "chatgpt") {
+    return {
+      label: text.subscriptionUnavailable,
+      title: text.subscriptionUnavailableHint,
+    };
+  }
+
+  return { label: text.emptyValue };
+}
+
+function nextUsageResetAt(account: AccountSummary): number | null {
+  const window = account.usage?.oneWeek;
+  if (!window) {
+    return null;
+  }
+  return window.resetAt ?? account.usage!.fetchedAt + Math.max(0, window.windowSeconds);
 }
 
 type UsageFreshnessCopy = {
@@ -425,16 +398,6 @@ function UsageFreshnessBadge({
   );
 }
 
-function hasResetCredits(account: AccountSummary): boolean {
-  const resetCredits = account.usage?.resetCredits;
-  return Boolean(resetCredits && (resetCredits.availableCount !== null || resetCredits.credits.length > 0));
-}
-
-function eventTimestampToUnixSeconds(timestamp: number): number {
-  const timeOrigin = typeof performance === "undefined" ? 0 : performance.timeOrigin;
-  return Math.floor((timeOrigin + timestamp) / 1000);
-}
-
 function UsageMeter({
   label,
   windowLabel,
@@ -443,7 +406,7 @@ function UsageMeter({
   className,
 }: {
   label: string;
-  windowLabel: "5h" | "1w";
+  windowLabel: "1w";
   window: UsageWindow | null;
   text: UiCopy;
   className?: string;
@@ -472,68 +435,6 @@ function UsageMeter({
   );
 }
 
-function ResetCreditsSection({
-  account,
-  expanded,
-  locale,
-  text,
-  onToggle,
-}: {
-  account: AccountSummary;
-  expanded: boolean;
-  locale: string;
-  text: UiCopy;
-  onToggle: () => void;
-}) {
-  const resetCredits = account.usage?.resetCredits;
-  if (!resetCredits || !hasResetCredits(account)) {
-    return null;
-  }
-
-  const visibleCredits = expanded ? resetCredits.credits : resetCredits.credits.slice(0, 2);
-  const hiddenCount = Math.max(0, resetCredits.credits.length - visibleCredits.length);
-
-  return (
-    <section className="detailCard resetCreditsCard">
-      <div className="detailSectionTitle">
-        <h3>{text.resetCreditsTitle}</h3>
-        <span className="resetCreditsCount">
-          {text.resetCreditsAvailable(resetCredits.availableCount ?? null)}
-        </span>
-      </div>
-      {visibleCredits.length > 0 ? (
-        <div className="resetCreditList">
-          {visibleCredits.map((credit, index) => (
-            <div
-              className="resetCreditItem"
-              key={`${credit.grantedAt ?? "unknown"}-${credit.expiresAt ?? "unknown"}-${index}`}
-            >
-              <span className="resetCreditIndex">{index + 1}</span>
-              <div>
-                <span>{text.resetCreditsExpiresAt}</span>
-                <strong>{formatFullDate(credit.expiresAt, locale, text.emptyValue)}</strong>
-              </div>
-            </div>
-          ))}
-        </div>
-      ) : null}
-      {resetCredits.credits.length > 2 ? (
-        <button
-          className="ghost resetCreditsToggle"
-          type="button"
-          onClick={onToggle}
-          aria-expanded={expanded}
-        >
-          <svg className={expanded ? "resetCreditsToggleIcon isExpanded" : "resetCreditsToggleIcon"} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-            <path d="m6 9 6 6 6-6" />
-          </svg>
-          <span>{expanded ? text.resetCreditsCollapse : text.resetCreditsExpand(hiddenCount)}</span>
-        </button>
-      ) : null}
-    </section>
-  );
-}
-
 function TokenUsageStrip({
   tokenUsage,
   tokenUsageError,
@@ -552,15 +453,15 @@ function TokenUsageStrip({
   onExportAll: () => void;
 }) {
   const items = [
-    { label: "24H", value: tokenUsage?.last24h.totalTokens },
-    { label: "3D", value: tokenUsage?.last3d.totalTokens },
-    { label: "7D", value: tokenUsage?.last7d.totalTokens },
-    { label: "30D", value: tokenUsage?.last30d.totalTokens },
+    { label: "24H", value: tokenUsage?.last24hEffectiveTokens },
+    { label: "3D", value: tokenUsage?.last3dEffectiveTokens },
+    { label: "7D", value: tokenUsage?.last7dEffectiveTokens },
+    { label: "30D", value: tokenUsage?.last30dEffectiveTokens },
   ];
 
   return (
     <section className="accountTokenUsageStrip" aria-label={text.tokenUsageTitle}>
-      <strong>{text.tokenUsageTitle}</strong>
+      <strong title={text.tokenUsageHint}>{text.tokenUsageTitle}</strong>
       <div className="accountTokenUsageItems">
         {items.map((item) => (
           <span key={item.label} className="accountTokenUsageItem">
@@ -626,7 +527,7 @@ function MoreIcon() {
   );
 }
 
-function ActionIcon({ type }: { type: "login" | "export" | "delete" | "switch" | "edit" }) {
+function ActionIcon({ type }: { type: "login" | "test" | "export" | "delete" | "switch" }) {
   if (type === "delete") {
     return (
       <svg className="actionIconGlyph" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -656,11 +557,10 @@ function ActionIcon({ type }: { type: "login" | "export" | "delete" | "switch" |
     );
   }
 
-  if (type === "edit") {
+  if (type === "test") {
     return (
       <svg className="actionIconGlyph" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-        <path d="M12 20h9" />
-        <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
+        <path d="M4 12h3l2-5 4 10 2-5h5" />
       </svg>
     );
   }
@@ -686,12 +586,12 @@ export function AccountsGrid({
   exportingAccounts,
   authBusy,
   switchingId,
-  renamingAccountId,
+  testingAccountId,
   pendingDeleteId,
   onExportAll,
   onExport,
   onReauthorize,
-  onRename,
+  onTestStatus,
   onToggleApiProxy,
   onSwitch,
   onDelete,
@@ -703,12 +603,8 @@ export function AccountsGrid({
   const [planFilter, setPlanFilter] = useState("all");
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
   const [preferredVariantByGroup, setPreferredVariantByGroup] = useState<Record<string, string>>({});
-  const [editingAliasId, setEditingAliasId] = useState<string | null>(null);
-  const [aliasDraft, setAliasDraft] = useState("");
   const [openMenuAccountId, setOpenMenuAccountId] = useState<string | null>(null);
   const openMenuRootRef = useRef<HTMLDivElement | null>(null);
-  const [switchRecords, setSwitchRecords] = useState<SwitchRecord[]>([]);
-  const [expandedResetCreditsByAccount, setExpandedResetCreditsByAccount] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     if (!openMenuAccountId || typeof document === "undefined") {
@@ -784,7 +680,7 @@ export function AccountsGrid({
 
     return rows.filter((row) => {
       const account = row.account;
-      const status = accountStatus(account);
+      const status = getAccountStatus(account, undefined, usageRefreshError);
       const normalizedPlan = (account.planType || account.usage?.planType || "unknown").toLowerCase();
       const haystack = [
         account.label,
@@ -804,7 +700,7 @@ export function AccountsGrid({
         (planFilter === "all" || normalizedPlan === planFilter)
       );
     });
-  }, [planFilter, query, rows, statusFilter]);
+  }, [planFilter, query, rows, statusFilter, usageRefreshError]);
 
   const selectedRow =
     filteredRows.find((row) => row.account.id === selectedAccountId) ||
@@ -814,8 +710,6 @@ export function AccountsGrid({
     null;
 
   const selectAccount = (accountId: string) => {
-    setEditingAliasId(null);
-    setAliasDraft("");
     setOpenMenuAccountId(null);
     setSelectedAccountId(accountId);
   };
@@ -828,62 +722,13 @@ export function AccountsGrid({
     selectAccount(account.id);
   };
 
-  const startAliasEdit = (account: AccountSummary) => {
-    setEditingAliasId(account.id);
-    setAliasDraft(account.label);
-  };
-
-  const cancelAliasEdit = () => {
-    setEditingAliasId(null);
-    setAliasDraft("");
-  };
-
-  const commitAliasEdit = async (account: AccountSummary) => {
-    const normalized = aliasDraft.trim();
-    if (!normalized || normalized === account.label.trim()) {
-      cancelAliasEdit();
-      return;
-    }
-
-    const updated = await onRename(account, normalized);
-    if (updated) {
-      cancelAliasEdit();
-    }
-  };
-
-  const handleSwitch = async (account: AccountSummary, eventTimestamp: number) => {
+  const handleSwitch = async (account: AccountSummary) => {
     if (authBusy) {
       return;
     }
 
-    const sourceAccount = accounts.find((item) => item.isCurrent);
-    const now = eventTimestampToUnixSeconds(eventTimestamp);
-
     setOpenMenuAccountId(null);
-    const didSwitch = await onSwitch(account);
-    if (!didSwitch) {
-      return;
-    }
-
-    setSwitchRecords((current) => [
-      {
-        id: `${account.id}-${now}-${current.length}`,
-        target: displayAccountAddress(account, text.emptyValue),
-        source:
-          sourceAccount && sourceAccount.id !== account.id
-            ? displayAccountAddress(sourceAccount, text.emptyValue)
-            : text.emptyValue,
-        timestamp: now,
-      },
-      ...current,
-    ].slice(0, 5));
-  };
-
-  const toggleResetCredits = (accountId: string) => {
-    setExpandedResetCreditsByAccount((current) => ({
-      ...current,
-      [accountId]: !current[accountId],
-    }));
+    await onSwitch(account);
   };
 
   return (
@@ -908,6 +753,7 @@ export function AccountsGrid({
                 <option value="available">{text.statusAvailable}</option>
                 <option value="low">{text.statusLow}</option>
                 <option value="exhausted">{text.statusExhausted}</option>
+                <option value="checkFailed">{text.statusCheckFailed}</option>
                 <option value="issue">{text.statusIssue}</option>
               </select>
               <select value={planFilter} onChange={(event) => setPlanFilter(event.currentTarget.value)}>
@@ -942,16 +788,16 @@ export function AccountsGrid({
               />
               <div className="accountListHeader" aria-hidden="true">
                 <span>{copy.bottomDock.accounts}</span>
-                <span>{text.fiveHourUsage}</span>
                 <span>{text.weekUsage}</span>
-                <span>{text.resetTime}</span>
+                <span>{text.subscriptionExpiry}</span>
+                <span>{text.nextResetTime}</span>
                 <span>{text.proxyEnabled}</span>
                 <span>{text.switchAccount}</span>
               </div>
               <div className="accountRows">
                 {filteredRows.map((row) => {
                 const account = row.account;
-                const status = accountStatus(account);
+                const status = getAccountStatus(account, undefined, usageRefreshError);
                 const normalizedPlan = account.planType || account.usage?.planType;
                 const isSelected = selectedRow?.account.id === account.id;
                 const isSwitching = switchingId === account.id;
@@ -960,7 +806,16 @@ export function AccountsGrid({
                 const isDeletePending = pendingDeleteId === account.id;
                 const isMenuOpen = openMenuAccountId === account.id;
                 const accountAddress = displayAccountAddress(account, text.emptyValue);
-                const issueReason = accountIssueReason(account, text.issueFallbackReason);
+                const issueReason = accountIssueReason(
+                  account,
+                  text.issueFallbackReason,
+                  usageRefreshError,
+                );
+                const subscriptionExpiry = subscriptionExpiryDisplay(
+                  account,
+                  locale,
+                  text,
+                );
 
                 return (
                   <article
@@ -1008,7 +863,7 @@ export function AccountsGrid({
                           })}
                           <button
                             type="button"
-                            className="accountNameButton"
+                            className="accountAddressButton accountPrimaryAddress"
                             title={accountAddress}
                             onClick={(event) => {
                               event.stopPropagation();
@@ -1021,11 +876,15 @@ export function AccountsGrid({
                         <span className="accountStateLine">
                           <span
                             className={`statusText status-${status}`}
-                            title={status === "issue" ? (issueReason ?? text.issueFallbackReason) : statusLabel(status, text)}
+                            title={
+                              status === "issue" || status === "checkFailed"
+                                ? (issueReason ?? text.issueFallbackReason)
+                                : statusLabel(status, text)
+                            }
                           >
                             <span className="statusDot" />
                             <span className="statusLabel">{statusLabel(status, text)}</span>
-                            {status === "issue" ? (
+                            {status === "issue" || status === "checkFailed" ? (
                               <span className="statusReason">{issueReason ?? text.issueFallbackReason}</span>
                             ) : null}
                           </span>
@@ -1041,22 +900,19 @@ export function AccountsGrid({
                       </span>
                     </div>
                     <UsageMeter
-                      className="accountUsageFive"
-                      label={text.fiveHourUsage}
-                      windowLabel="5h"
-                      window={account.usage?.fiveHour ?? null}
-                      text={text}
-                    />
-                    <UsageMeter
                       className="accountUsageWeek"
                       label={text.weekUsage}
                       windowLabel="1w"
                       window={account.usage?.oneWeek ?? null}
                       text={text}
                     />
+                    <div className="dateCell subscriptionCell">
+                      <strong title={subscriptionExpiry.title}>
+                        {subscriptionExpiry.label}
+                      </strong>
+                    </div>
                     <div className="resetCell">
-                      <span>{formatResetValue(account.usage?.fiveHour?.resetAt, locale, text.emptyValue)}</span>
-                      <strong>{formatResetValue(account.usage?.oneWeek?.resetAt, locale, text.emptyValue)}</strong>
+                      <strong>{formatDateTime(nextUsageResetAt(account), locale, text.emptyValue)}</strong>
                     </div>
                     <label className="rowToggle" onClick={(event) => event.stopPropagation()}>
                       <input
@@ -1076,7 +932,7 @@ export function AccountsGrid({
                         disabled={switchDisabled}
                         onClick={(event) => {
                           event.stopPropagation();
-                          void handleSwitch(account, event.timeStamp);
+                          void handleSwitch(account);
                         }}
                       >
                         {isSwitching ? copy.accountCard.launching : text.switchAccount}
@@ -1096,6 +952,17 @@ export function AccountsGrid({
                       </button>
                       {isMenuOpen ? (
                         <div className="rowActionMenu" onClick={(event) => event.stopPropagation()}>
+                          <button
+                            type="button"
+                            disabled={testingAccountId === account.id}
+                            onClick={() => {
+                              setOpenMenuAccountId(null);
+                              void onTestStatus(account);
+                            }}
+                          >
+                            <ActionIcon type="test" />
+                            {testingAccountId === account.id ? text.testingStatus : text.testStatus}
+                          </button>
                           <button
                             type="button"
                             onClick={() => {
@@ -1139,198 +1006,6 @@ export function AccountsGrid({
           )}
         </div>
       </div>
-
-      <aside className="accountDetailPanel" aria-label={text.detailsTitle}>
-        {selectedRow ? (
-          <>
-            <header className="detailHeader">
-              <div className="detailIdentity">
-                <span className={`accountAvatar detailAvatar tone-${planTone(selectedRow.account.planType || selectedRow.account.usage?.planType)}`}>
-                  {accountInitial(selectedRow.account)}
-                </span>
-                <div className="detailTitleBlock">
-                  <span className={`planChip tone-${planTone(selectedRow.account.planType || selectedRow.account.usage?.planType)} isStatic`}>
-                    {formatPlan(
-                      selectedRow.account.planType || selectedRow.account.usage?.planType,
-                      copy.accountCard.planLabels,
-                    )}
-                  </span>
-                  {editingAliasId === selectedRow.account.id ? (
-                    <div className="detailAliasEditor">
-                      <input
-                        value={aliasDraft}
-                        onChange={(event) => setAliasDraft(event.currentTarget.value)}
-                        disabled={renamingAccountId === selectedRow.account.accountKey}
-                        onKeyDown={(event) => {
-                          if (event.key === "Escape") {
-                            event.preventDefault();
-                            cancelAliasEdit();
-                          }
-                          if (event.key === "Enter") {
-                            event.preventDefault();
-                            void commitAliasEdit(selectedRow.account);
-                          }
-                        }}
-                        autoFocus
-                      />
-                      <button type="button" onClick={() => void commitAliasEdit(selectedRow.account)}>
-                        {text.save}
-                      </button>
-                      <button type="button" onClick={cancelAliasEdit}>
-                        {text.cancel}
-                      </button>
-                    </div>
-                  ) : (
-                    <h2>{selectedRow.account.label}</h2>
-                  )}
-                  <span
-                    className={`statusText status-${accountStatus(selectedRow.account)}`}
-                    title={
-                      accountStatus(selectedRow.account) === "issue"
-                        ? (accountIssueReason(selectedRow.account, text.issueFallbackReason) ?? text.issueFallbackReason)
-                        : statusLabel(accountStatus(selectedRow.account), text)
-                    }
-                  >
-                    <span className="statusDot" />
-                    <span className="statusLabel">{statusLabel(accountStatus(selectedRow.account), text)}</span>
-                    {accountStatus(selectedRow.account) === "issue" ? (
-                      <span className="statusReason">
-                        {accountIssueReason(selectedRow.account, text.issueFallbackReason) ?? text.issueFallbackReason}
-                      </span>
-                    ) : null}
-                  </span>
-                </div>
-              </div>
-              <button
-                type="button"
-                className="detailEditButton"
-                onClick={() => startAliasEdit(selectedRow.account)}
-                disabled={editingAliasId === selectedRow.account.id || renamingAccountId === selectedRow.account.accountKey}
-              >
-                <ActionIcon type="edit" />
-                {text.edit}
-              </button>
-            </header>
-
-            <section className="detailCard">
-              <div className="detailCardTitle">
-                <h3>{text.usageOverview}</h3>
-                <UsageFreshnessBadge
-                  account={selectedRow.account}
-                  refreshing={usageRefreshing}
-                  showInitialRefresh={showInitialUsageRefresh}
-                  refreshError={usageRefreshError}
-                  locale={locale}
-                  copy={copy.accountsGrid}
-                />
-              </div>
-              <UsageMeter
-                label={text.fiveHourUsage}
-                windowLabel="5h"
-                window={selectedRow.account.usage?.fiveHour ?? null}
-                text={text}
-              />
-              <UsageMeter
-                label={text.weekUsage}
-                windowLabel="1w"
-                window={selectedRow.account.usage?.oneWeek ?? null}
-                text={text}
-              />
-            </section>
-
-            <section className="detailMetaGrid">
-              <div>
-                <span>{text.membershipPeriodEnds}</span>
-                <strong>
-                  {formatFullDate(
-                    selectedRow.account.subscriptionActiveUntil,
-                    locale,
-                    text.emptyValue,
-                  )}
-                </strong>
-              </div>
-              <div>
-                <span>{text.planType}</span>
-                <strong>
-                  {formatPlan(
-                    selectedRow.account.planType || selectedRow.account.usage?.planType,
-                    copy.accountCard.planLabels,
-                  )}
-                </strong>
-              </div>
-            </section>
-
-            <ResetCreditsSection
-              account={selectedRow.account}
-              expanded={Boolean(expandedResetCreditsByAccount[selectedRow.account.id])}
-              locale={locale}
-              text={text}
-              onToggle={() => toggleResetCredits(selectedRow.account.id)}
-            />
-
-            <section className="detailCard recentSwitchCard">
-              <div className="detailSectionTitle">
-                <h3>{text.recentSwitches}</h3>
-              </div>
-              {switchRecords.length > 0 ? (
-                <ul className="recentSwitchList">
-                  {switchRecords.map((record) => (
-                    <li key={record.id}>
-                      <span className="statusDot status-using" />
-                      <span>{text.switchRecordAction}</span>
-                      <strong>{formatFullDate(record.timestamp, locale, text.emptyValue)}</strong>
-                      <em>{record.source === text.emptyValue ? record.target : `${text.fromPrefix} ${record.source}`}</em>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="recentSwitchEmpty">{text.noSwitchRecords}</p>
-              )}
-            </section>
-
-            <section className="detailCard quickActionCard">
-              <h3>{text.quickActions}</h3>
-              <div className="quickActionGrid">
-                <button type="button" onClick={() => onReauthorize(selectedRow.account)}>
-                  <ActionIcon type="login" />
-                  <span>{text.reauthorize}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={(event) => {
-                    void handleSwitch(selectedRow.account, event.timeStamp);
-                  }}
-                  disabled={authBusy}
-                >
-                  <ActionIcon type="switch" />
-                  <span>{text.switchAccount}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onExport(selectedRow.account)}
-                  disabled={exportingAccounts}
-                >
-                  <ActionIcon type="export" />
-                  <span>{text.exportAccount}</span>
-                </button>
-                <button
-                  type="button"
-                  className="dangerAction"
-                  onClick={() => onDelete(selectedRow.account)}
-                >
-                  <ActionIcon type="delete" />
-                  <span>{text.deleteAccount}</span>
-                </button>
-              </div>
-            </section>
-          </>
-        ) : (
-          <div className="detailEmpty">
-            <h3>{copy.accountsGrid.emptyTitle}</h3>
-            <p>{copy.accountsGrid.emptyDescription}</p>
-          </div>
-        )}
-      </aside>
     </section>
   );
 }

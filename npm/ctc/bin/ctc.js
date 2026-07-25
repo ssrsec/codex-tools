@@ -5,19 +5,19 @@ const { existsSync } = require("node:fs");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 
-const PACKAGE_NAME = "@170-carry/ctc";
-const RELEASE_URL = "https://github.com/170-carry/codex-tools/releases/latest";
+const PACKAGE_NAME = "@ssrsec/ctc";
+const RELEASE_URL = "https://github.com/ssrsec/codex-tools/releases/latest";
 const NATIVE_PACKAGES = {
   "darwin:arm64": {
-    name: "@170-carry/ctc-darwin-arm64",
+    name: "@ssrsec/ctc-darwin-arm64",
     bin: "codex-tools-cli",
   },
   "darwin:x64": {
-    name: "@170-carry/ctc-darwin-x64",
+    name: "@ssrsec/ctc-darwin-x64",
     bin: "codex-tools-cli",
   },
   "win32:x64": {
-    name: "@170-carry/ctc-win32-x64",
+    name: "@ssrsec/ctc-win32-x64",
     bin: "codex-tools-cli.exe",
   },
 };

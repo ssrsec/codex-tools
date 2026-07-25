@@ -34,9 +34,8 @@ const SESSION_EXPORT_LIMIT: usize = 500;
 const TOKEN_USAGE_TAIL_SIGNATURE_BYTES: u64 = 128;
 const FORK_MATCH_RESYNC_WINDOW: usize = 32;
 const FORK_MATCH_ANCHOR_RECORDS: usize = 4;
-const PRICING_SOURCE: &str =
-    "OpenAI API standard short-context pricing, text tokens per 1M, checked 2026-07-10";
-const COST_ANALYTICS_CACHE_VERSION: u8 = 8;
+const PRICING_SOURCE: &str = "OpenAI API standard short-context text-token pricing per 1M; excludes service-tier, long-context, cache-write, and tool fees; checked 2026-07-26";
+const COST_ANALYTICS_CACHE_VERSION: u8 = 10;
 const COST_SOURCE_LOCAL: &str = "local_estimate";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -66,6 +65,11 @@ pub(crate) struct CodexTokenUsageSnapshot {
     pub(crate) unresolved_fork_count: usize,
     pub(crate) unresolved_usage_event_count: usize,
     pub(crate) event_count: usize,
+    pub(crate) excluded_agent_session_count: usize,
+    pub(crate) last_24h_effective_tokens: u64,
+    pub(crate) last_3d_effective_tokens: u64,
+    pub(crate) last_7d_effective_tokens: u64,
+    pub(crate) last_30d_effective_tokens: u64,
     pub(crate) last_24h: CodexTokenTotals,
     pub(crate) last_3d: CodexTokenTotals,
     pub(crate) last_7d: CodexTokenTotals,
@@ -84,6 +88,8 @@ pub(crate) struct CodexCostAnalyticsSnapshot {
     pub(crate) unresolved_fork_count: usize,
     #[serde(default)]
     pub(crate) unresolved_usage_event_count: usize,
+    #[serde(default)]
+    pub(crate) excluded_agent_session_count: usize,
     pub(crate) event_count: usize,
     pub(crate) total: CodexTokenTotals,
     pub(crate) total_cost_usd: f64,
@@ -94,18 +100,11 @@ pub(crate) struct CodexCostAnalyticsSnapshot {
     #[serde(default)]
     pub(crate) local_last_7d_cost_usd: f64,
     #[serde(default)]
-    pub(crate) budget_period_cost_usd: f64,
-    #[serde(default)]
-    pub(crate) local_budget_period_cost_usd: f64,
-    #[serde(default)]
     pub(crate) cost_source: String,
     #[serde(default)]
     pub(crate) cost_source_updated_at: Option<i64>,
     #[serde(default)]
     pub(crate) cost_source_error: Option<String>,
-    pub(crate) weekly_budget_usd: Option<f64>,
-    pub(crate) weekly_budget_percent: Option<f64>,
-    pub(crate) weekly_budget_alert: String,
     pub(crate) projects: Vec<CodexProjectCostBreakdown>,
     pub(crate) sessions: Vec<CodexSessionCostBreakdown>,
     pub(crate) heatmap: Vec<CodexHourlyCostBucket>,
@@ -372,6 +371,11 @@ fn build_codex_token_usage_snapshot(
         unresolved_fork_count: 0,
         unresolved_usage_event_count: 0,
         event_count: 0,
+        excluded_agent_session_count: 0,
+        last_24h_effective_tokens: 0,
+        last_3d_effective_tokens: 0,
+        last_7d_effective_tokens: 0,
+        last_30d_effective_tokens: 0,
         last_24h: CodexTokenTotals::default(),
         last_3d: CodexTokenTotals::default(),
         last_7d: CodexTokenTotals::default(),
@@ -405,19 +409,44 @@ fn build_codex_token_usage_snapshot(
         let delta_result =
             derive_confirmed_token_deltas(&session.events, ownership.inherited_record_end);
         snapshot.unresolved_usage_event_count += delta_result.unresolved_event_count;
+        let is_agent_session = session.parent_thread_id.is_some();
+        if is_agent_session {
+            snapshot.excluded_agent_session_count += 1;
+        }
         for event in &delta_result.events {
             snapshot.event_count += 1;
+            let effective_tokens = effective_interactive_token_count(&event.total);
             if event.timestamp >= last_24h_start {
                 snapshot.last_24h.add(&event.total);
+                if !is_agent_session {
+                    snapshot.last_24h_effective_tokens = snapshot
+                        .last_24h_effective_tokens
+                        .saturating_add(effective_tokens);
+                }
             }
             if event.timestamp >= last_3d_start {
                 snapshot.last_3d.add(&event.total);
+                if !is_agent_session {
+                    snapshot.last_3d_effective_tokens = snapshot
+                        .last_3d_effective_tokens
+                        .saturating_add(effective_tokens);
+                }
             }
             if event.timestamp >= last_7d_start {
                 snapshot.last_7d.add(&event.total);
+                if !is_agent_session {
+                    snapshot.last_7d_effective_tokens = snapshot
+                        .last_7d_effective_tokens
+                        .saturating_add(effective_tokens);
+                }
             }
             if event.timestamp >= last_30d_start {
                 snapshot.last_30d.add(&event.total);
+                if !is_agent_session {
+                    snapshot.last_30d_effective_tokens = snapshot
+                        .last_30d_effective_tokens
+                        .saturating_add(effective_tokens);
+                }
             }
         }
 
@@ -434,6 +463,23 @@ fn build_codex_token_usage_snapshot(
     }
 
     snapshot
+}
+
+fn effective_interactive_token_count(total: &CodexTokenTotals) -> u64 {
+    effective_interactive_token_totals(total).total_tokens
+}
+
+fn effective_interactive_token_totals(total: &CodexTokenTotals) -> CodexTokenTotals {
+    // cached_input_tokens is a subset of input_tokens. User-facing statistics
+    // report only newly processed input plus output.
+    let cached_input_tokens = total.cached_input_tokens.min(total.input_tokens);
+    CodexTokenTotals {
+        input_tokens: total.input_tokens.saturating_sub(cached_input_tokens),
+        cached_input_tokens: 0,
+        output_tokens: total.output_tokens,
+        reasoning_output_tokens: total.reasoning_output_tokens,
+        total_tokens: total.total_tokens.saturating_sub(cached_input_tokens),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -684,7 +730,6 @@ fn lineage_has_cycle(
 }
 
 pub(crate) fn collect_codex_cost_analytics_snapshot_with_progress<F>(
-    weekly_budget_usd: Option<f64>,
     on_progress: F,
 ) -> Result<CodexCostAnalyticsSnapshot, String>
 where
@@ -705,7 +750,6 @@ where
     Ok(scan_codex_cost_analytics_roots_with_cache(
         &roots,
         now_unix_seconds(),
-        weekly_budget_usd,
         &mut cache,
         on_progress,
     ))
@@ -715,26 +759,18 @@ where
 fn scan_codex_cost_analytics_roots_with_progress<F>(
     roots: &[PathBuf],
     now: i64,
-    weekly_budget_usd: Option<f64>,
     on_progress: F,
 ) -> CodexCostAnalyticsSnapshot
 where
     F: FnMut(CodexCostAnalyticsProgress),
 {
     let mut cache = CostAnalyticsCache::default();
-    scan_codex_cost_analytics_roots_with_cache(
-        roots,
-        now,
-        weekly_budget_usd,
-        &mut cache,
-        on_progress,
-    )
+    scan_codex_cost_analytics_roots_with_cache(roots, now, &mut cache, on_progress)
 }
 
 fn scan_codex_cost_analytics_roots_with_cache<F>(
     roots: &[PathBuf],
     now: i64,
-    weekly_budget_usd: Option<f64>,
     cache: &mut CostAnalyticsCache,
     mut on_progress: F,
 ) -> CodexCostAnalyticsSnapshot
@@ -848,6 +884,8 @@ where
             "成本分析已排除 {removed_replayed_event_count} 条 fork 会话复制的历史 Token 事件"
         );
     }
+    let excluded_agent_session_count =
+        convert_analytics_to_main_session_effective_usage(&mut parsed_files);
 
     let mut event_count = 0usize;
     let mut sessions = Vec::new();
@@ -858,7 +896,6 @@ where
     let mut total_cost_usd = 0.0;
     let mut last_7d = CodexTokenTotals::default();
     let mut last_7d_cost_usd = 0.0;
-    let mut budget_period_cost_usd = 0.0;
 
     for parsed in parsed_files {
         let ParsedAnalyticsSessionFile {
@@ -893,7 +930,6 @@ where
                 last_7d_cost_usd += event.cost_usd;
             }
             if event.timestamp >= heatmap_start {
-                budget_period_cost_usd += event.cost_usd;
                 if let Some(bucket_key) = heatmap_bucket_key(event.timestamp) {
                     if let Some(bucket) = heatmap.get_mut(&bucket_key) {
                         bucket.calls += 1;
@@ -952,6 +988,7 @@ where
         failed_path_count,
         unresolved_fork_count,
         unresolved_usage_event_count,
+        excluded_agent_session_count,
         event_count,
         total,
         total_cost_usd: round_cost(total_cost_usd),
@@ -959,37 +996,14 @@ where
         last_7d,
         last_7d_cost_usd: round_cost(last_7d_cost_usd),
         local_last_7d_cost_usd: round_cost(last_7d_cost_usd),
-        budget_period_cost_usd: round_cost(budget_period_cost_usd),
-        local_budget_period_cost_usd: round_cost(budget_period_cost_usd),
         cost_source: COST_SOURCE_LOCAL.to_string(),
         cost_source_updated_at: Some(now),
         cost_source_error: None,
-        weekly_budget_usd: None,
-        weekly_budget_percent: None,
-        weekly_budget_alert: "none".to_string(),
         projects: project_breakdowns,
         sessions: sessions.into_iter().take(SESSION_EXPORT_LIMIT).collect(),
         heatmap: heatmap.into_values().collect(),
         top_prompts,
     };
-    apply_codex_cost_analytics_budget(snapshot, weekly_budget_usd)
-}
-
-pub(crate) fn apply_codex_cost_analytics_budget(
-    mut snapshot: CodexCostAnalyticsSnapshot,
-    weekly_budget_usd: Option<f64>,
-) -> CodexCostAnalyticsSnapshot {
-    let weekly_budget_usd = normalize_budget(weekly_budget_usd);
-    let weekly_budget_percent = weekly_budget_usd.map(|budget| {
-        if budget <= 0.0 {
-            0.0
-        } else {
-            (snapshot.budget_period_cost_usd / budget) * 100.0
-        }
-    });
-    snapshot.weekly_budget_usd = weekly_budget_usd;
-    snapshot.weekly_budget_percent = weekly_budget_percent.map(round_percent);
-    snapshot.weekly_budget_alert = weekly_budget_alert(weekly_budget_percent);
     snapshot
 }
 
@@ -997,7 +1011,6 @@ fn normalize_cost_source_fields(snapshot: &mut CodexCostAnalyticsSnapshot) {
     if snapshot.cost_source.trim().is_empty() {
         snapshot.local_total_cost_usd = snapshot.total_cost_usd;
         snapshot.local_last_7d_cost_usd = snapshot.last_7d_cost_usd;
-        snapshot.local_budget_period_cost_usd = snapshot.budget_period_cost_usd;
         snapshot.cost_source = COST_SOURCE_LOCAL.to_string();
         snapshot.cost_source_updated_at = Some(snapshot.updated_at);
     }
@@ -1015,7 +1028,6 @@ pub(crate) fn serialize_codex_cost_analytics_cache(
 
 pub(crate) fn parse_codex_cost_analytics_cache(
     raw: &str,
-    weekly_budget_usd: Option<f64>,
 ) -> Result<Option<CodexCostAnalyticsSnapshot>, String> {
     if raw.trim().is_empty() {
         return Ok(None);
@@ -1027,20 +1039,14 @@ pub(crate) fn parse_codex_cost_analytics_cache(
         }
         let mut snapshot = cache.snapshot;
         normalize_cost_source_fields(&mut snapshot);
-        return Ok(Some(apply_codex_cost_analytics_budget(
-            snapshot,
-            weekly_budget_usd,
-        )));
+        return Ok(Some(snapshot));
     }
 
     let snapshot = serde_json::from_str::<CodexCostAnalyticsSnapshot>(raw)
         .map_err(|error| format!("解析成本分析缓存失败: {error}"))?;
     let mut snapshot = snapshot;
     normalize_cost_source_fields(&mut snapshot);
-    Ok(Some(apply_codex_cost_analytics_budget(
-        snapshot,
-        weekly_budget_usd,
-    )))
+    Ok(Some(snapshot))
 }
 
 pub(crate) fn serialize_codex_cost_analytics_export(
@@ -1559,6 +1565,27 @@ fn apply_analytics_lineage_ownership(
         unresolved_fork_count,
         unresolved_usage_event_count,
     )
+}
+
+fn convert_analytics_to_main_session_effective_usage(
+    files: &mut Vec<ParsedAnalyticsSessionFile>,
+) -> usize {
+    let original_file_count = files.len();
+    files.retain(|file| file.parent_thread_id.is_none());
+    let excluded_agent_session_count = original_file_count.saturating_sub(files.len());
+
+    for file in files {
+        for event in &mut file.events {
+            // Cost is an API-equivalent estimate, so cached input still carries
+            // the model's discounted cached-input price. The user-facing token
+            // total below intentionally excludes that cached subset.
+            event.cost_usd = estimate_token_cost_usd(&event.model, &event.total);
+            event.total = effective_interactive_token_totals(&event.total);
+        }
+        refresh_analytics_session_summary(file);
+    }
+
+    excluded_agent_session_count
 }
 
 fn apply_cumulative_deltas_to_analytics(
@@ -2269,31 +2296,8 @@ fn cost_analytics_progress(
     }
 }
 
-fn normalize_budget(value: Option<f64>) -> Option<f64> {
-    value.and_then(|budget| {
-        if budget.is_finite() && budget > 0.0 {
-            Some(round_cost(budget))
-        } else {
-            None
-        }
-    })
-}
-
-fn weekly_budget_alert(percent: Option<f64>) -> String {
-    match percent {
-        Some(value) if value >= 100.0 => "danger".to_string(),
-        Some(value) if value >= 80.0 => "warning".to_string(),
-        Some(_) => "ok".to_string(),
-        None => "none".to_string(),
-    }
-}
-
 fn round_cost(value: f64) -> f64 {
     (value * 1_000_000.0).round() / 1_000_000.0
-}
-
-fn round_percent(value: f64) -> f64 {
-    (value * 10.0).round() / 10.0
 }
 
 fn estimate_token_cost_usd(model: &str, usage: &CodexTokenTotals) -> f64 {
@@ -2344,44 +2348,44 @@ fn pricing_rate_for_model(model: &str) -> PricingRate {
     }
     if normalized.starts_with("gpt-5.5-pro") {
         return PricingRate {
-            input_per_million: 15.0,
-            cached_input_per_million: 15.0,
-            output_per_million: 90.0,
+            input_per_million: 30.0,
+            cached_input_per_million: 30.0,
+            output_per_million: 180.0,
         };
     }
     if normalized.starts_with("gpt-5.5") {
         return PricingRate {
-            input_per_million: 2.5,
-            cached_input_per_million: 0.25,
-            output_per_million: 15.0,
+            input_per_million: 5.0,
+            cached_input_per_million: 0.5,
+            output_per_million: 30.0,
         };
     }
     if normalized.starts_with("gpt-5.4-pro") {
         return PricingRate {
-            input_per_million: 15.0,
-            cached_input_per_million: 15.0,
-            output_per_million: 90.0,
+            input_per_million: 30.0,
+            cached_input_per_million: 30.0,
+            output_per_million: 180.0,
         };
     }
     if normalized.starts_with("gpt-5.4-mini") {
         return PricingRate {
-            input_per_million: 0.375,
-            cached_input_per_million: 0.0375,
-            output_per_million: 2.25,
+            input_per_million: 0.75,
+            cached_input_per_million: 0.075,
+            output_per_million: 4.5,
         };
     }
     if normalized.starts_with("gpt-5.4-nano") {
         return PricingRate {
-            input_per_million: 0.1,
-            cached_input_per_million: 0.01,
-            output_per_million: 0.625,
+            input_per_million: 0.2,
+            cached_input_per_million: 0.02,
+            output_per_million: 1.25,
         };
     }
     if normalized.starts_with("gpt-5.4") {
         return PricingRate {
-            input_per_million: 1.25,
-            cached_input_per_million: 0.13,
-            output_per_million: 7.5,
+            input_per_million: 2.5,
+            cached_input_per_million: 0.25,
+            output_per_million: 15.0,
         };
     }
     if normalized.contains("codex-mini") || normalized.starts_with("gpt-5-mini") {
@@ -2917,6 +2921,28 @@ mod tests {
     }
 
     #[test]
+    fn uses_official_standard_pricing_for_recent_gpt_5_models() {
+        for (model, input, cached, output) in [
+            ("gpt-5.5-pro", 30.0, 30.0, 180.0),
+            ("gpt-5.5", 5.0, 0.5, 30.0),
+            ("gpt-5.4-pro", 30.0, 30.0, 180.0),
+            ("gpt-5.4", 2.5, 0.25, 15.0),
+            ("gpt-5.4-mini", 0.75, 0.075, 4.5),
+            ("gpt-5.4-nano", 0.2, 0.02, 1.25),
+            ("gpt-5-mini", 0.25, 0.025, 2.0),
+            ("gpt-5-nano", 0.05, 0.005, 0.4),
+        ] {
+            let rate = pricing_rate_for_model(model);
+            assert_eq!(rate.input_per_million, input, "input price for {model}");
+            assert_eq!(
+                rate.cached_input_per_million, cached,
+                "cached input price for {model}"
+            );
+            assert_eq!(rate.output_per_million, output, "output price for {model}");
+        }
+    }
+
+    #[test]
     fn parses_codex_token_event_lines() {
         let event =
             parse_token_event_line(&event_line("2026-04-28T06:37:43.263Z", 40902952, 206498))
@@ -2956,6 +2982,10 @@ mod tests {
 
         assert_eq!(snapshot.source_path_count, 1);
         assert_eq!(snapshot.event_count, 2);
+        assert_eq!(snapshot.excluded_agent_session_count, 0);
+        assert_eq!(snapshot.last_24h_effective_tokens, 250);
+        assert_eq!(snapshot.last_3d_effective_tokens, 340);
+        assert_eq!(snapshot.last_7d_effective_tokens, 340);
         assert_eq!(snapshot.last_24h.total_tokens, 250);
         assert_eq!(snapshot.last_3d.total_tokens, 350);
         assert_eq!(snapshot.last_7d.total_tokens, 350);
@@ -3006,22 +3036,18 @@ mod tests {
             100
         );
 
-        let analytics_snapshot = scan_codex_cost_analytics_roots_with_progress(
-            &[root.join("sessions")],
-            now,
-            None,
-            |_| {},
-        );
+        let analytics_snapshot =
+            scan_codex_cost_analytics_roots_with_progress(&[root.join("sessions")], now, |_| {});
         assert_eq!(analytics_snapshot.event_count, 1);
-        assert_eq!(analytics_snapshot.total.total_tokens, 100);
-        assert_eq!(analytics_snapshot.last_7d.total_tokens, 100);
+        assert_eq!(analytics_snapshot.total.total_tokens, 90);
+        assert_eq!(analytics_snapshot.last_7d.total_tokens, 90);
         assert_eq!(
             analytics_snapshot
                 .heatmap
                 .iter()
                 .map(|bucket| bucket.tokens)
                 .sum::<u64>(),
-            100
+            90
         );
 
         let _ = fs::remove_dir_all(root);
@@ -3057,10 +3083,10 @@ mod tests {
         assert_eq!(token_snapshot.last_7d.total_tokens, 120);
 
         let analytics_snapshot =
-            scan_codex_cost_analytics_roots_with_progress(&[sessions], now, None, |_| {});
+            scan_codex_cost_analytics_roots_with_progress(&[sessions], now, |_| {});
         assert_eq!(analytics_snapshot.unresolved_usage_event_count, 1);
         assert_eq!(analytics_snapshot.event_count, 2);
-        assert_eq!(analytics_snapshot.total.total_tokens, 120);
+        assert_eq!(analytics_snapshot.total.total_tokens, 110);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3212,22 +3238,18 @@ mod tests {
             50
         );
 
-        let analytics_snapshot = scan_codex_cost_analytics_roots_with_progress(
-            &[root.join("sessions")],
-            now,
-            None,
-            |_| {},
-        );
+        let analytics_snapshot =
+            scan_codex_cost_analytics_roots_with_progress(&[root.join("sessions")], now, |_| {});
         assert_eq!(analytics_snapshot.event_count, 3);
-        assert_eq!(analytics_snapshot.total.total_tokens, 350);
-        assert_eq!(analytics_snapshot.last_7d.total_tokens, 350);
+        assert_eq!(analytics_snapshot.total.total_tokens, 340);
+        assert_eq!(analytics_snapshot.last_7d.total_tokens, 340);
         assert_eq!(
             analytics_snapshot
                 .heatmap
                 .iter()
                 .map(|bucket| bucket.tokens)
                 .sum::<u64>(),
-            350
+            340
         );
         let child = analytics_snapshot
             .sessions
@@ -3294,14 +3316,10 @@ mod tests {
             50
         );
 
-        let analytics_snapshot = scan_codex_cost_analytics_roots_with_progress(
-            &[root.join("sessions")],
-            now,
-            None,
-            |_| {},
-        );
+        let analytics_snapshot =
+            scan_codex_cost_analytics_roots_with_progress(&[root.join("sessions")], now, |_| {});
         assert_eq!(analytics_snapshot.event_count, 3);
-        assert_eq!(analytics_snapshot.total.total_tokens, 350);
+        assert_eq!(analytics_snapshot.total.total_tokens, 340);
         let child = analytics_snapshot
             .sessions
             .iter()
@@ -3368,15 +3386,11 @@ mod tests {
             25
         );
 
-        let analytics_snapshot = scan_codex_cost_analytics_roots_with_progress(
-            &[root.join("sessions")],
-            now,
-            None,
-            |_| {},
-        );
+        let analytics_snapshot =
+            scan_codex_cost_analytics_roots_with_progress(&[root.join("sessions")], now, |_| {});
         assert_eq!(analytics_snapshot.unresolved_fork_count, 0);
         assert_eq!(analytics_snapshot.event_count, 4);
-        assert_eq!(analytics_snapshot.total.total_tokens, 375);
+        assert_eq!(analytics_snapshot.total.total_tokens, 365);
         assert_eq!(
             analytics_snapshot
                 .sessions
@@ -3454,7 +3468,7 @@ mod tests {
         assert_eq!(token_snapshot.last_7d.total_tokens, 0);
 
         let analytics_snapshot =
-            scan_codex_cost_analytics_roots_with_progress(&[sessions], now, None, |_| {});
+            scan_codex_cost_analytics_roots_with_progress(&[sessions], now, |_| {});
         assert_eq!(analytics_snapshot.unresolved_fork_count, 1);
         assert_eq!(analytics_snapshot.event_count, 0);
         assert_eq!(analytics_snapshot.total.total_tokens, 0);
@@ -3488,11 +3502,15 @@ mod tests {
         let token_snapshot = scan_codex_token_usage_roots(&[sessions.clone()], now);
         assert_eq!(token_snapshot.unresolved_fork_count, 0);
         assert_eq!(token_snapshot.last_7d.total_tokens, 100);
+        assert_eq!(token_snapshot.excluded_agent_session_count, 1);
+        assert_eq!(token_snapshot.last_7d_effective_tokens, 0);
 
         let analytics_snapshot =
-            scan_codex_cost_analytics_roots_with_progress(&[sessions], now, None, |_| {});
+            scan_codex_cost_analytics_roots_with_progress(&[sessions], now, |_| {});
         assert_eq!(analytics_snapshot.unresolved_fork_count, 0);
-        assert_eq!(analytics_snapshot.total.total_tokens, 100);
+        assert_eq!(analytics_snapshot.event_count, 0);
+        assert_eq!(analytics_snapshot.excluded_agent_session_count, 1);
+        assert_eq!(analytics_snapshot.total.total_tokens, 0);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3552,9 +3570,11 @@ mod tests {
         assert_eq!(token_snapshot.last_7d.total_tokens, 100);
 
         let analytics_snapshot =
-            scan_codex_cost_analytics_roots_with_progress(&[sessions], now, None, |_| {});
+            scan_codex_cost_analytics_roots_with_progress(&[sessions], now, |_| {});
         assert_eq!(analytics_snapshot.unresolved_usage_event_count, 0);
-        assert_eq!(analytics_snapshot.total.total_tokens, 100);
+        assert_eq!(analytics_snapshot.event_count, 0);
+        assert_eq!(analytics_snapshot.excluded_agent_session_count, 1);
+        assert_eq!(analytics_snapshot.total.total_tokens, 0);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3602,7 +3622,6 @@ mod tests {
         let first_analytics = scan_codex_cost_analytics_roots_with_cache(
             std::slice::from_ref(&sessions),
             now,
-            None,
             &mut analytics_cache,
             |_| {},
         );
@@ -3625,12 +3644,11 @@ mod tests {
         let second_analytics = scan_codex_cost_analytics_roots_with_cache(
             &[sessions],
             now + 1,
-            None,
             &mut analytics_cache,
             |_| {},
         );
         assert_eq!(second_analytics.unresolved_fork_count, 0);
-        assert_eq!(second_analytics.total.total_tokens, 150);
+        assert_eq!(second_analytics.total.total_tokens, 140);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3711,14 +3729,11 @@ mod tests {
         let snapshot = scan_codex_cost_analytics_roots_with_progress(
             &[sessions],
             now.unix_timestamp(),
-            None,
             |_| {},
         );
 
         assert_eq!(snapshot.total.total_tokens, 300);
         assert_eq!(snapshot.last_7d.total_tokens, 100);
-        assert_eq!(snapshot.budget_period_cost_usd, snapshot.total_cost_usd);
-        assert!(snapshot.budget_period_cost_usd > snapshot.last_7d_cost_usd);
         assert_eq!(
             snapshot
                 .heatmap
@@ -3732,7 +3747,7 @@ mod tests {
     }
 
     #[test]
-    fn scans_cost_analytics_by_project_session_prompt_and_budget() {
+    fn scans_effective_cost_analytics_by_project_session_and_prompt() {
         let root = unique_temp_dir();
         let sessions = root.join("sessions").join("2026").join("06").join("10");
         fs::create_dir_all(&sessions).expect("create sessions dir");
@@ -3777,15 +3792,14 @@ mod tests {
         let snapshot = scan_codex_cost_analytics_roots_with_progress(
             &[root.join("sessions")],
             now,
-            Some(0.01),
             |progress| progress_events.push(progress),
         );
 
         assert_eq!(snapshot.source_path_count, 1);
         assert_eq!(snapshot.event_count, 1);
-        assert_eq!(snapshot.total.total_tokens, 3_000);
-        assert!((snapshot.total_cost_usd - 0.032275).abs() < 0.000001);
-        assert_eq!(snapshot.weekly_budget_alert, "danger");
+        assert_eq!(snapshot.total.total_tokens, 2_900);
+        assert_eq!(snapshot.total.cached_input_tokens, 0);
+        assert!((snapshot.total_cost_usd - 0.06455).abs() < 0.000001);
         assert_eq!(progress_events.last().expect("progress").percent, 100);
         assert_eq!(snapshot.projects[0].project_name, "project-alpha");
         assert_eq!(snapshot.projects[0].prompt_count, 1);
@@ -3807,12 +3821,10 @@ mod tests {
             serialize_codex_cost_analytics_cache(&snapshot).expect("cache export"),
         )
         .expect("utf8 cache");
-        let cached = parse_codex_cost_analytics_cache(&cache, Some(1.0))
+        let cached = parse_codex_cost_analytics_cache(&cache)
             .expect("cache parse")
             .expect("cache snapshot");
         assert_eq!(cached.event_count, snapshot.event_count);
-        assert_eq!(cached.weekly_budget_usd, Some(1.0));
-        assert_eq!(cached.weekly_budget_alert, "ok");
 
         assert!(
             (snapshot.total_cost_usd
@@ -3859,14 +3871,12 @@ mod tests {
         let roots = [root.join("sessions"), root.join("archived_sessions")];
         let now = parse_timestamp("2026-07-21T02:00:00Z").expect("parse now");
         let mut cache = CostAnalyticsCache::default();
-        let initial =
-            scan_codex_cost_analytics_roots_with_cache(&roots, now, None, &mut cache, |_| {});
+        let initial = scan_codex_cost_analytics_roots_with_cache(&roots, now, &mut cache, |_| {});
         assert_eq!(initial.event_count, 1);
-        assert_eq!(initial.total.total_tokens, 3_000);
+        assert_eq!(initial.total.total_tokens, 2_900);
         assert_eq!(cache.last_scan.reparsed_files, 1);
 
-        let unchanged =
-            scan_codex_cost_analytics_roots_with_cache(&roots, now, None, &mut cache, |_| {});
+        let unchanged = scan_codex_cost_analytics_roots_with_cache(&roots, now, &mut cache, |_| {});
         assert_eq!(unchanged, initial);
         assert_eq!(cache.last_scan.reused_files, 1);
         assert_eq!(cache.last_scan.appended_files, 0);
@@ -3897,10 +3907,9 @@ mod tests {
         .expect("append token event");
         drop(file);
 
-        let appended =
-            scan_codex_cost_analytics_roots_with_cache(&roots, now, None, &mut cache, |_| {});
+        let appended = scan_codex_cost_analytics_roots_with_cache(&roots, now, &mut cache, |_| {});
         assert_eq!(appended.event_count, 2);
-        assert_eq!(appended.total.total_tokens, 9_000);
+        assert_eq!(appended.total.total_tokens, 8_700);
         assert_eq!(cache.last_scan.appended_files, 1);
         assert_eq!(cache.last_scan.reparsed_files, 0);
         assert_eq!(
@@ -3913,7 +3922,7 @@ mod tests {
             fs::metadata(&path).expect("read appended metadata").len()
         );
         let appended_unchanged =
-            scan_codex_cost_analytics_roots_with_cache(&roots, now, None, &mut cache, |_| {});
+            scan_codex_cost_analytics_roots_with_cache(&roots, now, &mut cache, |_| {});
         assert_eq!(appended_unchanged, appended);
         assert_eq!(cache.last_scan.reused_files, 1);
         assert_eq!(cache.last_scan.appended_files, 0);
@@ -3921,7 +3930,7 @@ mod tests {
 
         let mut fresh_cache = CostAnalyticsCache::default();
         let freshly_parsed =
-            scan_codex_cost_analytics_roots_with_cache(&roots, now, None, &mut fresh_cache, |_| {});
+            scan_codex_cost_analytics_roots_with_cache(&roots, now, &mut fresh_cache, |_| {});
         assert_eq!(appended, freshly_parsed);
 
         fs::write(
@@ -3939,17 +3948,15 @@ mod tests {
             ),
         )
         .expect("rewrite analytics log");
-        let rewritten =
-            scan_codex_cost_analytics_roots_with_cache(&roots, now, None, &mut cache, |_| {});
+        let rewritten = scan_codex_cost_analytics_roots_with_cache(&roots, now, &mut cache, |_| {});
         assert_eq!(rewritten.event_count, 1);
-        assert_eq!(rewritten.total.total_tokens, 10_000);
+        assert_eq!(rewritten.total.total_tokens, 9_100);
         assert_eq!(rewritten.sessions[0].session_id, "rewritten-session");
         assert_eq!(cache.last_scan.reparsed_files, 1);
         assert_eq!(cache.last_scan.appended_files, 0);
 
         fs::remove_file(&path).expect("delete analytics log");
-        let deleted =
-            scan_codex_cost_analytics_roots_with_cache(&roots, now, None, &mut cache, |_| {});
+        let deleted = scan_codex_cost_analytics_roots_with_cache(&roots, now, &mut cache, |_| {});
         assert_eq!(deleted.source_path_count, 0);
         assert_eq!(deleted.event_count, 0);
         assert!(cache.files.is_empty());

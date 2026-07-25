@@ -1,4 +1,5 @@
 import type { AccountSummary, UsageWindow } from "../types/app";
+import { accountIsAvailableForAutomaticUse } from "./accountStatus.ts";
 
 const UNKNOWN_REMAINING = -1;
 
@@ -12,22 +13,27 @@ function windowRemainingPercent(window: UsageWindow | null | undefined): number 
 
 function accountRemainingScore(account: AccountSummary): {
   oneWeek: number;
-  fiveHour: number;
 } {
   return {
     oneWeek: windowRemainingPercent(account.usage?.oneWeek),
-    fiveHour: windowRemainingPercent(account.usage?.fiveHour),
   };
 }
 
 function accountHasPositiveRemaining(account: AccountSummary): boolean {
   const score = accountRemainingScore(account);
-  return score.oneWeek > 0 || score.fiveHour > 0;
+  return score.oneWeek > 0;
 }
 
 function accountHasKnownRemaining(account: AccountSummary): boolean {
   const score = accountRemainingScore(account);
-  return score.oneWeek >= 0 || score.fiveHour >= 0;
+  return score.oneWeek >= 0;
+}
+
+export function accountIsAvailableForSmartSwitch(
+  account: AccountSummary,
+  nowSeconds = Math.floor(Date.now() / 1000),
+): boolean {
+  return accountIsAvailableForAutomaticUse(account, nowSeconds);
 }
 
 export function compareAccountsByRemaining(a: AccountSummary, b: AccountSummary): number {
@@ -38,12 +44,9 @@ export function compareAccountsByRemaining(a: AccountSummary, b: AccountSummary)
   const left = accountRemainingScore(a);
   const right = accountRemainingScore(b);
 
-  // 优先比较 1week 余量，再比较 5h 余量，保证排序/智能切换口径一致。
+  // Codex 当前只保留主额度窗口，按周额度余量排序。
   if (right.oneWeek !== left.oneWeek) {
     return right.oneWeek - left.oneWeek;
-  }
-  if (right.fiveHour !== left.fiveHour) {
-    return right.fiveHour - left.fiveHour;
   }
 
   // 余量一致时，优先展示当前账号，再按标签稳定排序。
@@ -68,7 +71,9 @@ export function pickBestSmartSwitchAccount(
   accounts: AccountSummary[],
   includeApiFallback: boolean,
 ): AccountSummary | null {
-  const sorted = sortAccountsByRemaining(accounts);
+  const sorted = sortAccountsByRemaining(
+    accounts.filter((account) => accountIsAvailableForSmartSwitch(account)),
+  );
   if (sorted.length === 0) {
     return null;
   }

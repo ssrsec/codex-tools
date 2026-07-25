@@ -3,7 +3,10 @@ import { useI18n } from "../i18n/I18nProvider";
 type AddAccountSectionProps = {
   onOpenAddDialog: () => void;
   onSmartSwitch: () => void;
+  onCleanupUnavailable: () => void;
   smartSwitching: boolean;
+  cleaningUnavailable: boolean;
+  cleanupUnavailableCount: number;
 };
 
 function SparkIcon() {
@@ -30,15 +33,39 @@ function PlusIcon() {
   );
 }
 
+function CleanupIcon() {
+  return (
+    <svg className="buttonIcon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M4 7h16" />
+      <path d="M9 7V4h6v3" />
+      <path d="m7 7 1 13h8l1-13" />
+    </svg>
+  );
+}
+
 export function AddAccountSection({
   onOpenAddDialog,
   onSmartSwitch,
+  onCleanupUnavailable,
   smartSwitching,
+  cleaningUnavailable,
+  cleanupUnavailableCount,
 }: AddAccountSectionProps) {
   const { copy } = useI18n();
 
   return (
     <section className="importBar">
+      <button
+        className="ghost dangerTextButton importCleanup"
+        onClick={onCleanupUnavailable}
+        disabled={cleaningUnavailable || cleanupUnavailableCount === 0}
+        title={`${copy.addAccount.cleanupUnavailable} (${cleanupUnavailableCount})`}
+      >
+        <CleanupIcon />
+        {cleaningUnavailable
+          ? copy.addAccount.cleaningUnavailable
+          : `${copy.addAccount.cleanupUnavailable} (${cleanupUnavailableCount})`}
+      </button>
       <button
         className="ghost smartSwitchButton importSmartSwitch"
         onClick={onSmartSwitch}

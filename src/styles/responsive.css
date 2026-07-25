@@ -81,44 +81,6 @@
     padding: 0 0 20px;
   }
 
-  .updateOverlay {
-    padding: 12px;
-  }
-
-  .updateDialog {
-    max-height: calc(100vh - 24px);
-    border-radius: 14px;
-  }
-
-  .updateDialogHeader {
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 10px;
-    padding: 14px;
-  }
-
-  .updateDialogIcon {
-    display: none;
-  }
-
-  .updateDialogContent {
-    padding: 12px;
-  }
-
-  .updateDialogActions {
-    padding: 12px;
-  }
-
-  .updateDialogActions > button {
-    flex: 1 1 100%;
-  }
-
-  .debugFloatingTool {
-    top: auto;
-    right: 12px;
-    bottom: calc(env(safe-area-inset-bottom, 0px) + 76px);
-    width: min(220px, calc(100vw - 24px));
-  }
-
   .settingsHeader {
     flex-direction: column;
     padding: 2px 2px 4px;
@@ -269,6 +231,7 @@
     justify-content: stretch;
   }
 
+  .importCleanup,
   .importSmartSwitch,
   .importPrimary {
     flex: 1 1 0;
@@ -284,19 +247,16 @@
   }
 
   .analyticsHeader,
-  .analyticsBudget,
   .analyticsGrid,
   .analyticsStats {
     grid-template-columns: 1fr;
   }
 
-  .analyticsActions,
-  .analyticsBudgetActions {
+  .analyticsActions {
     justify-content: stretch;
   }
 
-  .analyticsActions > button,
-  .analyticsBudgetActions > button {
+  .analyticsActions > button {
     flex: 1 1 0;
     min-width: 0;
   }
@@ -363,9 +323,9 @@
     grid-template-columns: minmax(0, 1fr) auto;
     grid-template-areas:
       "identity actions"
-      "five five"
       "week week"
-      "reset proxy";
+      "subscription reset"
+      "proxy proxy";
     align-items: start;
     gap: 12px;
   }
@@ -374,12 +334,12 @@
     grid-area: identity;
   }
 
-  .accountUsageFive {
-    grid-area: five;
-  }
-
   .accountUsageWeek {
     grid-area: week;
+  }
+
+  .accountRow .subscriptionCell {
+    grid-area: subscription;
   }
 
   .accountRow .resetCell {

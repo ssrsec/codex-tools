@@ -17,6 +17,7 @@ use crate::account_service;
 use crate::app_paths;
 use crate::auth;
 use crate::cli;
+use crate::models::account_is_eligible_for_automatic_use;
 use crate::models::mark_current_account_summary;
 use crate::models::AccountSourceKind;
 use crate::models::AccountSummary;
@@ -862,30 +863,28 @@ fn account_partial_match(account: &StoredAccount, raw_ref: &str) -> bool {
 }
 
 fn pick_best_account_index(accounts: &[StoredAccount]) -> Result<usize, String> {
+    let now = utils::now_unix_seconds();
     accounts
         .iter()
         .enumerate()
+        .filter(|(_, account)| account_is_eligible_for_automatic_use(account, now))
         .min_by_key(|(_, account)| account_rank(account))
         .map(|(index, _)| index)
-        .ok_or_else(|| "账号列表为空".to_string())
+        .ok_or_else(|| {
+            "暂无可用账号：登录失效、Free 套餐和额度已耗尽的账号已自动排除。".to_string()
+        })
 }
 
-fn account_rank(account: &StoredAccount) -> (u8, u8, i64, i64, i64) {
+fn account_rank(account: &StoredAccount) -> (u8, u8, i64, i64) {
     let blocked = u8::from(account.auth_refresh_blocked);
     let has_error = u8::from(account.usage_error.is_some());
-    let five_hour = usage_percent_millis(
-        account
-            .usage
-            .as_ref()
-            .and_then(|usage| usage.five_hour.as_ref()),
-    );
     let one_week = usage_percent_millis(
         account
             .usage
             .as_ref()
             .and_then(|usage| usage.one_week.as_ref()),
     );
-    (blocked, has_error, one_week, five_hour, -account.updated_at)
+    (blocked, has_error, one_week, -account.updated_at)
 }
 
 fn usage_percent_millis(window: Option<&crate::models::UsageWindow>) -> i64 {
@@ -1086,8 +1085,8 @@ fn print_accounts(accounts: &[AccountSummary], json: bool) -> Result<(), String>
         return print_json(accounts);
     }
     println!(
-        "{:<4} {:<1} {:<22} {:<28} {:<10} {:>8} {:>8} {}",
-        "#", "*", "id", "label", "plan", "5h", "1w", "email/error"
+        "{:<4} {:<1} {:<22} {:<28} {:<10} {:>8} {}",
+        "#", "*", "id", "label", "plan", "quota", "email/error"
     );
     for (index, account) in accounts.iter().enumerate() {
         let marker = if account.is_current { "*" } else { "" };
@@ -1098,18 +1097,12 @@ fn print_accounts(accounts: &[AccountSummary], json: bool) -> Result<(), String>
             .or(account.email.as_deref())
             .unwrap_or("");
         println!(
-            "{:<4} {:<1} {:<22} {:<28} {:<10} {:>8} {:>8} {}",
+            "{:<4} {:<1} {:<22} {:<28} {:<10} {:>8} {}",
             index + 1,
             marker,
             utils::short_account(&account.account_id),
             truncate_cell(&account.label, 28),
             truncate_cell(account.plan_type.as_deref().unwrap_or("-"), 10),
-            format_window_percent(
-                account
-                    .usage
-                    .as_ref()
-                    .and_then(|usage| usage.five_hour.as_ref())
-            ),
             format_window_percent(
                 account
                     .usage

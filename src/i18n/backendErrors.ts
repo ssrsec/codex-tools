@@ -75,13 +75,13 @@ const REPLACEMENTS: PhraseReplacement[] = [
     ),
   },
   {
-    source: "当前账号不是 ChatGPT 登录模式，无法读取 Codex 5h/1week 用量。请先执行 codex login。",
+    source: "当前账号不是 ChatGPT 登录模式，无法读取 Codex 额度。请先执行 codex login。",
     target: phrases(
-      "当前账号不是 ChatGPT 登录模式，无法读取 Codex 5h/1week 用量。请先执行 codex login。",
-      "The current account is not using ChatGPT sign-in mode, so Codex 5h/1week usage cannot be read. Run codex login first.",
-      "現在のアカウントは ChatGPT ログインモードではないため、Codex 5h/1week の使用量を読み取れません。先に codex login を実行してください。",
-      "현재 계정이 ChatGPT 로그인 모드가 아니어서 Codex 5h/1week 사용량을 읽을 수 없습니다. 먼저 codex login을 실행하세요.",
-      "Текущий аккаунт не использует вход через ChatGPT, поэтому невозможно прочитать использование Codex 5h/1week. Сначала выполните codex login."
+      "当前账号不是 ChatGPT 登录模式，无法读取 Codex 额度。请先执行 codex login。",
+      "The current account is not using ChatGPT sign-in mode, so Codex quota usage cannot be read. Run codex login first.",
+      "現在のアカウントは ChatGPT ログインモードではないため、Codex の使用量を読み取れません。先に codex login を実行してください。",
+      "현재 계정이 ChatGPT 로그인 모드가 아니어서 Codex 사용량을 읽을 수 없습니다. 먼저 codex login을 실행하세요.",
+      "Текущий аккаунт не использует вход через ChatGPT, поэтому невозможно прочитать использование Codex. Сначала выполните codex login."
     ),
   },
   {

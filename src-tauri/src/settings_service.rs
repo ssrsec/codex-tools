@@ -100,19 +100,12 @@ pub(crate) async fn update_app_settings_internal(
             store.settings.api_proxy_disabled_models =
                 sanitize_api_proxy_disabled_models_for_settings(value);
         }
-        if let Some(value) = patch.codex_analytics_weekly_budget_usd {
-            store.settings.codex_analytics_weekly_budget_usd = normalize_weekly_budget(value);
-        }
         if let Some(value) = patch.remote_servers {
             store.settings.remote_servers = value;
         }
         if let Some(value) = patch.locale {
             store.settings.locale = value;
         }
-        if let Some(value) = patch.skipped_update_version {
-            store.settings.skipped_update_version = value;
-        }
-
         let settings = store.settings.clone();
         save_store(app, &store)?;
         settings
@@ -277,16 +270,6 @@ fn apply_proxy_environment(proxy_url: Option<&str>) {
 fn should_discard_codex_launch_path(path: &str) -> bool {
     cli::is_windows_store_codex_path(std::path::Path::new(path))
         && cli::has_windows_store_codex_app()
-}
-
-fn normalize_weekly_budget(value: Option<f64>) -> Option<f64> {
-    value.and_then(|amount| {
-        if amount.is_finite() && amount > 0.0 {
-            Some((amount * 100.0).round() / 100.0)
-        } else {
-            None
-        }
-    })
 }
 
 #[cfg(test)]

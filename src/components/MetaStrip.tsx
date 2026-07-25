@@ -1,20 +1,34 @@
 import { useI18n } from "../i18n/I18nProvider";
 import type { AccountSummary } from "../types/app";
-import { remainingPercent } from "../utils/usage";
+import {
+  averageAvailableWeeklyUsage,
+  getAccountStatus,
+} from "../utils/accountStatus";
 
 type MetaStripProps = {
   accounts: AccountSummary[];
+  refreshError: string | null;
   exportingAccounts: boolean;
   onExportAccounts: () => void;
 };
 
-type MetricTone = "blue" | "green" | "amber" | "red";
+type MetricTone = "blue" | "green" | "amber" | "red" | "violet";
 
 type MetricIconProps = {
   tone: MetricTone;
 };
 
 function MetricIcon({ tone }: MetricIconProps) {
+  if (tone === "violet") {
+    return (
+      <svg className="metricIconGlyph" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M4 18V6" />
+        <path d="M4 18h16" />
+        <path d="m7 14 4-4 3 2 5-6" />
+      </svg>
+    );
+  }
+
   if (tone === "green") {
     return (
       <svg className="metricIconGlyph" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -50,63 +64,77 @@ function MetricIcon({ tone }: MetricIconProps) {
   );
 }
 
-function hasBlockingAccountIssue(account: AccountSummary): boolean {
-  return Boolean(
-    account.authRefreshBlocked ||
-      account.profileIntegrityError ||
-      account.profileLastValidationError ||
-      account.authRefreshError,
-  );
-}
-
-function hasExhaustedWindow(account: AccountSummary): boolean {
-  return [account.usage?.fiveHour ?? null, account.usage?.oneWeek ?? null].some((window) => {
-    const remaining = remainingPercent(window);
-    return remaining !== null && remaining <= 0;
-  });
-}
-
 export function MetaStrip({
   accounts,
+  refreshError,
   exportingAccounts,
   onExportAccounts,
 }: MetaStripProps) {
   const { copy, locale } = useI18n();
   const isChinese = locale === "zh-CN";
-  const issueCount = accounts.filter(hasBlockingAccountIssue).length;
-  const exhaustedCount = accounts.filter((account) => !hasBlockingAccountIssue(account) && hasExhaustedWindow(account)).length;
-  const activeCount = accounts.filter(
-    (account) => !hasBlockingAccountIssue(account) && !hasExhaustedWindow(account) && account.profileAuthReady,
+  const groupedStatuses = Array.from(
+    accounts.reduce((groups, account) => {
+      const statuses = groups.get(account.accountKey) ?? [];
+      statuses.push(getAccountStatus(account, undefined, refreshError));
+      groups.set(account.accountKey, statuses);
+      return groups;
+    }, new Map<string, ReturnType<typeof getAccountStatus>[]>()),
+  ).map(([, statuses]) => {
+    if (statuses.some((status) => status === "using" || status === "available" || status === "low")) {
+      return "active";
+    }
+    if (statuses.some((status) => status === "exhausted")) {
+      return "exhausted";
+    }
+    if (statuses.some((status) => status === "checkFailed")) {
+      return "checkFailed";
+    }
+    return "issue";
+  });
+  const issueCount = groupedStatuses.filter(
+    (status) => status === "issue" || status === "checkFailed",
   ).length;
+  const exhaustedCount = groupedStatuses.filter((status) => status === "exhausted").length;
+  const activeCount = groupedStatuses.filter((status) => status === "active").length;
+  const averageWeeklyUsage = averageAvailableWeeklyUsage(
+    accounts,
+    undefined,
+    refreshError,
+  );
   const metrics: Array<{
     label: string;
-    value: number;
-    helper: string;
+    value: string | number;
     tone: MetricTone;
   }> = [
     {
       label: copy.metaStrip.accountCount,
-      value: accounts.length,
-      helper: isChinese ? "个账号" : "total",
+      value: groupedStatuses.length,
       tone: "blue",
     },
     {
       label: isChinese ? "活跃账号" : "Active",
       value: activeCount,
-      helper: isChinese ? "正常使用" : "ready",
       tone: "green",
     },
     {
       label: isChinese ? "已耗尽" : "Exhausted",
       value: exhaustedCount,
-      helper: isChinese ? "使用率 100%" : "used 100%",
       tone: "amber",
     },
     {
       label: isChinese ? "异常账号" : "Needs attention",
       value: issueCount,
-      helper: isChinese ? "需要关注" : "review",
       tone: "red",
+    },
+    {
+      label: isChinese ? "平均周使用率" : "Avg. weekly usage",
+      value:
+        averageWeeklyUsage === null
+          ? "--"
+          : `${averageWeeklyUsage.toLocaleString(locale, {
+              maximumFractionDigits: 1,
+            })}%`,
+      tone: "violet",
     },
   ];
 
@@ -120,14 +148,13 @@ export function MetaStrip({
           <span className="metricCopy">
             <span>{metric.label}</span>
             <strong>{metric.value}</strong>
-            <em>{metric.helper}</em>
           </span>
         </article>
       ))}
       <button
         className="ghost metaExportButton"
         onClick={onExportAccounts}
-        disabled={exportingAccounts || accounts.length === 0}
+        disabled={exportingAccounts || groupedStatuses.length === 0}
         aria-label={copy.metaStrip.exportAll}
       >
         {copy.metaStrip.exportAll}

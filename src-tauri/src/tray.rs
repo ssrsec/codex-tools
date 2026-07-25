@@ -57,22 +57,8 @@ fn mode_percent(mode: TrayUsageDisplayMode, window: Option<&UsageWindow>) -> Opt
     }
 }
 
-fn single_window_for_mode(
-    mode: TrayUsageDisplayMode,
-    usage: Option<&UsageSnapshot>,
-) -> Option<&UsageWindow> {
-    match mode {
-        TrayUsageDisplayMode::FiveHourRemaining => usage.and_then(|usage| usage.five_hour.as_ref()),
-        TrayUsageDisplayMode::OneWeekRemaining => usage.and_then(|usage| usage.one_week.as_ref()),
-        _ => None,
-    }
-}
-
-fn only_show_single_window(mode: TrayUsageDisplayMode) -> bool {
-    matches!(
-        mode,
-        TrayUsageDisplayMode::FiveHourRemaining | TrayUsageDisplayMode::OneWeekRemaining
-    )
+fn active_usage_window(usage: Option<&UsageSnapshot>) -> Option<&UsageWindow> {
+    usage.and_then(|usage| usage.one_week.as_ref())
 }
 
 fn should_show_macos_status_item(mode: TrayUsageDisplayMode) -> bool {
@@ -105,37 +91,13 @@ fn tray_account_usage_line(
         return format!("{current_prefix}{}", account.label);
     }
 
-    if only_show_single_window(mode) {
-        let selected_window = format_percent(mode_percent(
-            mode,
-            single_window_for_mode(mode, account.usage.as_ref()),
-        ));
-        let remaining_label = i18n::tray_usage_mode_label(locale, TrayUsageDisplayMode::Remaining);
-        return format!(
-            "{current_prefix}{} | {remaining_label} {selected_window}",
-            account.label
-        );
-    }
-
-    let five_hour = format_percent(mode_percent(
+    let usage_value = format_percent(mode_percent(
         mode,
-        account
-            .usage
-            .as_ref()
-            .and_then(|usage| usage.five_hour.as_ref()),
+        active_usage_window(account.usage.as_ref()),
     ));
-
-    let one_week = format_percent(mode_percent(
-        mode,
-        account
-            .usage
-            .as_ref()
-            .and_then(|usage| usage.one_week.as_ref()),
-    ));
-
     let mode_label = i18n::tray_usage_mode_label(locale, mode);
     format!(
-        "{current_prefix}{} | 5h{mode_label} {five_hour} | 1week{mode_label} {one_week}",
+        "{current_prefix}{} | {mode_label} {usage_value}",
         account.label
     )
 }
@@ -151,57 +113,21 @@ fn build_macos_tray_title(
     }
 
     if let Some(current) = accounts.iter().find(|account| account.is_current) {
-        if only_show_single_window(mode) {
-            let selected_window = format_percent(mode_percent(
-                mode,
-                single_window_for_mode(mode, current.usage.as_ref()),
-            ));
-            if !show_window_labels {
-                return selected_window;
-            }
-            return match mode {
-                TrayUsageDisplayMode::FiveHourRemaining => format!("5h {selected_window}"),
-                TrayUsageDisplayMode::OneWeekRemaining => format!("1w {selected_window}"),
-                _ => unreachable!("single-window modes are handled above"),
-            };
-        }
-
-        let five_hour = format_percent(mode_percent(
+        let selected_window = format_percent(mode_percent(
             mode,
-            current
-                .usage
-                .as_ref()
-                .and_then(|usage| usage.five_hour.as_ref()),
-        ));
-        let one_week = format_percent(mode_percent(
-            mode,
-            current
-                .usage
-                .as_ref()
-                .and_then(|usage| usage.one_week.as_ref()),
+            active_usage_window(current.usage.as_ref()),
         ));
         return if show_window_labels {
-            format!("5h {five_hour} / 1w {one_week}")
+            format!("1w {selected_window}")
         } else {
-            format!("{five_hour} / {one_week}")
-        };
-    }
-
-    if only_show_single_window(mode) {
-        if !show_window_labels {
-            return "--".to_string();
-        }
-        return match mode {
-            TrayUsageDisplayMode::FiveHourRemaining => "5h --".to_string(),
-            TrayUsageDisplayMode::OneWeekRemaining => "1w --".to_string(),
-            _ => unreachable!("single-window modes are handled above"),
+            selected_window
         };
     }
 
     if show_window_labels {
-        "5h -- / 1w --".to_string()
+        "1w --".to_string()
     } else {
-        "-- / --".to_string()
+        "--".to_string()
     }
 }
 
@@ -759,6 +685,7 @@ mod tests {
             usage: Some(UsageSnapshot {
                 fetched_at: 0,
                 plan_type: Some("pro".to_string()),
+                // Retain a conflicting legacy value to prove tray rendering ignores it.
                 five_hour: Some(UsageWindow {
                     used_percent: 60.0,
                     window_seconds: 18_000,
@@ -824,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn window_labels_can_be_hidden_for_combined_usage_display() {
+    fn legacy_combined_usage_modes_render_only_the_active_window() {
         let account = current_account_with_usage();
 
         assert_eq!(
@@ -833,11 +760,25 @@ mod tests {
                 TrayUsageDisplayMode::Remaining,
                 false,
             ),
-            "40% / 60%"
+            "60%"
         );
         assert_eq!(
             build_macos_tray_title(&[account], TrayUsageDisplayMode::Remaining, true),
-            "5h 40% / 1w 60%"
+            "1w 60%"
+        );
+    }
+
+    #[test]
+    fn legacy_five_hour_mode_maps_to_the_active_week_window() {
+        let account = current_account_with_usage();
+
+        assert_eq!(
+            build_macos_tray_title(
+                std::slice::from_ref(&account),
+                TrayUsageDisplayMode::FiveHourRemaining,
+                true,
+            ),
+            "1w 60%"
         );
     }
 

@@ -236,11 +236,3 @@ pub(crate) fn app_menu_about(locale: AppLocale, app_name: &str) -> String {
 pub(crate) fn app_menu_settings(locale: AppLocale) -> String {
     format!("{}...", text(locale, &["settings", "title"]))
 }
-
-pub(crate) fn app_menu_check_updates(locale: AppLocale) -> String {
-    let label = match locale {
-        AppLocale::EnUs => "Check for Updates",
-        _ => text(locale, &["topBar", "checkUpdate"]),
-    };
-    format!("{label}...")
-}

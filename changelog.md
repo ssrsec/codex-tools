@@ -1,22 +1,19 @@
-## 更新日志 / Changelog
+## 更新日志
 
-### Unreleased
+### 未发布
 
-#### English
-
-1. Improve the macOS status bar and usage labels: use the color app icon, default to showing one-week remaining usage, optionally show 5h / 1w labels, hide the entire status item when disabled, and keep the account meters labeled 5h / 1w even when both values are currently identical.
-2. Significantly reduce default background energy use: remove Codex inference keepalive calls, deduplicate refreshes, pause foreground polling while the application's entire main window is hidden, and avoid repeated full log scans by reusing unchanged per-file results and tail-reading appended bytes for both the Token summary and detailed cost analytics. Detailed analytics now refreshes incrementally every minute as a fixed behavior; entering Analytics no longer starts a separate refresh, and the refresh-mode toggle has been removed.
-3. Improve first-launch account feedback: show stored accounts and the last saved quota snapshot immediately, refresh remote quota and non-critical startup work concurrently, show freshness only during first-load work, and hide the freshness badge after a successful refresh. Failed or unavailable states remain visible; failures show a concise cause while retaining the full error on hover.
-4. Fix startup and the macOS status bar after a Plus-to-Pro upgrade: reuse the cached Pro account when stale auth metadata still says Plus, keep the last quota visible during refresh, and correctly select the current account.
-5. Unify local Token analytics and the 7-day heatmap: derive actual increments from cumulative Token snapshots, ignore unchanged rebroadcasts, and exclude verified parent-history replays from forked sessions. Hourly buckets use local time, retain useful color contrast, localize labels, and show exact Token counts immediately on hover. Total, seven-day, project, session, prompt, and heatmap costs now share the same local-log model pricing. The seven-day card uses the previous seven completed local calendar days, while the cost alert uses the rolling latest 168 hours. Analytics no longer requests or caches official Profile activity.
-
-#### 中文
-
-1. 优化 macOS 状态栏和用量标签：使用彩色应用图标，默认仅显示一周剩余用量，可选显示 5h / 1w 标签，选择“不显示”时隐藏整个状态项；即使两个周期当前数值相同，账号用量栏仍分别标注 5h / 1w。
-2. 大幅降低默认模式下的后台耗电：移除 Codex 推理保活请求，去重刷新任务，在应用的整个主窗口隐藏时暂停前台轮询；Token 汇总与详细成本分析都会复用未变化文件的逐文件结果，并对增长日志采用尾量读取，避免反复完整扫描。详细分析现固定为每分钟增量刷新；进入分析页不再额外触发刷新，并移除刷新模式 toggle。
-3. 改善首次启动账号反馈：立即显示本地账号与上次保存的额度快照，并发刷新远端额度和非关键启动任务；新鲜度提示仅在首次加载期间出现，刷新成功后自动隐藏。失败或暂无数据状态仍会保留，其中失败提示直接显示简短原因，悬停时仍可查看完整错误。
-4. 修复 Plus 升级为 PRO 后的启动与状态栏账号识别：当认证元数据仍显示 Plus 时复用带缓存的 PRO 账号，刷新期间继续显示上次额度，并正确选中当前账号。
-5. 统一本机 Token 分析与 7 日热力图：根据累计 Token 快照计算实际增量，忽略累计值未变化的重复广播，并排除 fork 会话中已验证的父会话历史回放。小时数据按本地时间分桶，保留有效色阶，标签跟随界面语言，并在悬停时立即显示精确 Token 数量。总成本、7 日成本、项目、会话、prompt 与热力图现共用相同的本机日志模型计价。7 日成本采用前 7 个完整本地自然日，成本预警采用滚动最近 168 小时。分析页不再请求或缓存官方 Profile 活动量。
+1. 在审查并整合选定的上游贡献后，正式切换为独立维护的 `ssrsec/codex-tools` 版本；仓库、Issue、Release、npm 包、文档和构建元数据均指向当前维护仓库。
+2. 完整移除应用内更新功能，包括更新检查、提示横幅、安装弹窗、菜单入口、签名密钥要求、updater 权限与依赖、调试入口及发布工作流中的 updater 产物。后续版本直接通过当前仓库的发布渠道分发。
+3. 新增完整的账号健康状态模型：联合刷新授权与额度，优先采用用量接口返回的真实套餐，识别登录或授权过期、账号停用、变为 Free、当前额度耗尽以及临时网络/服务错误，并将“检测失败”和“确认不可用”明确区分。
+4. 自动切换和 API 反代接入健康状态，但不会在每次请求前遍历检测全部账号。已知封禁、Free、停用、额度耗尽、手动关闭反代的账号会提前排除；请求失败会记录分范围冷却，永久授权错误会移出代理池，额度错误会在服务端重置时间自动恢复，可重试错误会切换到下一个可用账号。
+5. 新增账号维护操作：可从单个账号的更多菜单中独立检测状态、控制是否参与反代，并可在确认后一次清理全部确定不可用且非当前账号。清理不会删除当前账号，也不会误删仅发生临时检测失败的账号。
+6. 重做账号主界面和列表：移除右侧独立详情区域与别名编辑，直接显示真实邮箱/账号地址；在列表中集中展示状态与失败原因、一周额度、订阅到期、下次重置、反代开关和操作入口，并修复卡片与列表错位。顶部统计新增仅针对去重后可用账号的平均周使用率，并修复异常账号数量。
+7. 从新用量快照、账号列表、统计逻辑和 macOS 状态栏模式中移除已经失效的 5 小时额度概念，界面仅使用当前一周额度窗口；读取旧设置和旧缓存时仍保持安全兼容。
+8. 修正账号页与分析页的 Token 统计：有效 Token 仅计算主会话的非缓存输入与输出，排除 Agent 子任务，移除已验证的 fork 父会话历史回放，忽略累计值未变化的重复广播；同时保留逐文件增量缓存和日志尾量读取，降低后台扫描开销。
+9. 重构分析页，使总量、项目、会话、Prompt 和 7 日热力图统一采用有效 Token 口径；API 等价成本则独立使用主会话归属后的可计费输入、折扣缓存输入和输出，并按当前官方标准短上下文费率估算。修正 GPT-5.4/5.5/5.6 系列价格，作废旧的虚高缓存，移除每周预算功能，并将项目与热力图改为紧凑的单列布局。
+10. 改善订阅和刷新反馈：ID Token 提供订阅结束日期时进行展示，刷新失败时继续保留上次有效额度，同时显示下一次额度重置；当 ChatGPT 判定账号可用但未在凭据中提供订阅结束日期时，明确显示“平台未提供”及原因说明。
+11. 优化启动和后台行为：启动时立即显示本地账号与缓存额度，并发执行相互独立的初始化任务，去重额度刷新，在整个主窗口隐藏时暂停前台轮询，移除推理保活请求，并保持套餐变化后的 macOS 状态栏与当前账号识别稳定。
+12. 扩充回归测试，覆盖账号可用性、清理、状态分类、授权刷新、代理故障转移与冷却、一周额度、账号去重、fork/Agent 用量归属、有效 Token、增量分析缓存、模型价格和跨平台启动行为。
 
 - v2.4.0
   1. macOS 支持启动新版 `ChatGPT.app`，并继续兼容旧版 `Codex.app`、`Codex Desktop.app` 与 `codex app` 回退

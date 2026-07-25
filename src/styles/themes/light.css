@@ -75,17 +75,6 @@
     rgba(34, 197, 94, 0.16) 58%,
     rgba(37, 99, 235, 0) 86%
   );
-  --update-border: rgba(37, 99, 235, 0.22);
-  --update-bg: #ffffff;
-  --update-strong: #0f172a;
-  --update-subtle: #64748b;
-  --update-body: #334155;
-  --update-progress: #2563eb;
-  --update-header-bg: #f8fafc;
-  --update-meta-bg: #f8fafc;
-  --update-log-bg: #ffffff;
-  --update-log-marker-bg: rgba(37, 99, 235, 0.1);
-  --update-log-marker-color: #1d4ed8;
   --empty-border: rgba(100, 116, 139, 0.36);
   --card-shine: rgba(148, 163, 184, 0.24);
   --card-shadow: inset 0 1px rgba(255, 255, 255, 0.84);

@@ -226,6 +226,58 @@ pub(crate) struct UsageWindow {
     pub(crate) reset_at: Option<i64>,
 }
 
+pub(crate) fn plan_type_is_free(plan_type: Option<&str>) -> bool {
+    plan_type
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("free"))
+}
+
+pub(crate) fn usage_has_active_exhausted_window(usage: Option<&UsageSnapshot>, now: i64) -> bool {
+    let Some(usage) = usage else {
+        return false;
+    };
+
+    usage.one_week.as_ref().is_some_and(|window| {
+        window.used_percent.is_finite()
+            && window.used_percent >= 100.0
+            && window.reset_at.unwrap_or_else(|| {
+                usage
+                    .fetched_at
+                    .saturating_add(window.window_seconds.max(0))
+            }) > now
+    })
+}
+
+pub(crate) fn usage_error_indicates_authorization_failure(error: Option<&str>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("401")
+        || normalized.contains("403")
+        || normalized.contains("unauthorized")
+        || normalized.contains("forbidden")
+        || normalized.contains("invalid_token")
+        || normalized.contains("authentication token")
+        || normalized.contains("登录授权")
+        || normalized.contains("账号被封禁")
+        || normalized.contains("deactivated")
+}
+
+pub(crate) fn account_is_eligible_for_automatic_use(account: &StoredAccount, now: i64) -> bool {
+    if account.auth_refresh_blocked
+        || usage_error_indicates_authorization_failure(account.usage_error.as_deref())
+    {
+        return false;
+    }
+    if matches!(account.source_kind, AccountSourceKind::Chatgpt)
+        && plan_type_is_free(account.resolved_plan_type().as_deref())
+    {
+        return false;
+    }
+    !usage_has_active_exhausted_window(account.usage.as_ref(), now)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CreditSnapshot {
@@ -316,6 +368,22 @@ pub(crate) struct TestApiAccountConnectionResult {
     pub(crate) ok: bool,
     pub(crate) balance_text: Option<String>,
     pub(crate) message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TestAccountStatusResult {
+    pub(crate) account: AccountSummary,
+    pub(crate) ok: bool,
+    pub(crate) message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CleanupUnusableAccountsResult {
+    pub(crate) deleted_ids: Vec<String>,
+    pub(crate) deleted_count: usize,
+    pub(crate) skipped_current_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -643,13 +711,10 @@ pub(crate) struct AppSettings {
     #[serde(default)]
     pub(crate) api_proxy_disabled_models: Vec<String>,
     #[serde(default)]
-    pub(crate) codex_analytics_weekly_budget_usd: Option<f64>,
-    #[serde(default)]
     pub(crate) api_proxy_sequential_account_key: Option<String>,
     pub(crate) remote_servers: Vec<RemoteServerConfig>,
     pub(crate) api_proxy_api_key: Option<String>,
     pub(crate) locale: AppLocale,
-    pub(crate) skipped_update_version: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -674,12 +739,10 @@ impl Default for AppSettings {
             api_proxy_sequential_five_hour_limit_percent:
                 default_api_proxy_sequential_five_hour_limit_percent(),
             api_proxy_disabled_models: Vec::new(),
-            codex_analytics_weekly_budget_usd: None,
             api_proxy_sequential_account_key: None,
             remote_servers: Vec::new(),
             api_proxy_api_key: None,
             locale: AppLocale::default(),
-            skipped_update_version: None,
         }
     }
 }
@@ -704,10 +767,8 @@ pub(crate) struct AppSettingsPatch {
     pub(crate) api_proxy_load_balance_mode: Option<ApiProxyLoadBalanceMode>,
     pub(crate) api_proxy_sequential_five_hour_limit_percent: Option<f64>,
     pub(crate) api_proxy_disabled_models: Option<Vec<String>>,
-    pub(crate) codex_analytics_weekly_budget_usd: Option<Option<f64>>,
     pub(crate) remote_servers: Option<Vec<RemoteServerConfig>>,
     pub(crate) locale: Option<AppLocale>,
-    pub(crate) skipped_update_version: Option<Option<String>>,
 }
 
 impl StoredAccount {
@@ -933,6 +994,7 @@ fn duplicate_account_merge_score(account: &StoredAccount) -> (u8, u8, u8, u8, i6
 
 #[cfg(test)]
 mod tests {
+    use super::account_is_eligible_for_automatic_use;
     use super::dedupe_account_variants;
     use super::mark_current_account_summary;
     use super::AppSettings;
@@ -1047,6 +1109,48 @@ mod tests {
             auth_refresh_error: None,
             api_proxy_enabled: true,
         }
+    }
+
+    #[test]
+    fn automatic_account_selection_excludes_known_unusable_accounts() {
+        let free = stored_account("free", "free", "account-1", Some("pro"), Some("free"), 100);
+        let mut blocked =
+            stored_account("blocked", "blocked", "account-2", Some("team"), None, 100);
+        blocked.auth_refresh_blocked = true;
+        let mut forbidden = stored_account(
+            "forbidden",
+            "forbidden",
+            "account-3",
+            Some("team"),
+            None,
+            100,
+        );
+        forbidden.usage_error = Some("403 Forbidden".to_string());
+
+        assert!(!account_is_eligible_for_automatic_use(&free, 15));
+        assert!(!account_is_eligible_for_automatic_use(&blocked, 15));
+        assert!(!account_is_eligible_for_automatic_use(&forbidden, 15));
+    }
+
+    #[test]
+    fn automatic_account_selection_respects_usage_reset_time() {
+        let mut account = stored_account(
+            "usage",
+            "usage",
+            "account-1",
+            Some("team"),
+            Some("team"),
+            100,
+        );
+        account
+            .usage
+            .as_mut()
+            .and_then(|usage| usage.one_week.as_mut())
+            .expect("active usage")
+            .used_percent = 100.0;
+
+        assert!(!account_is_eligible_for_automatic_use(&account, 15));
+        assert!(account_is_eligible_for_automatic_use(&account, 31));
     }
 
     #[test]

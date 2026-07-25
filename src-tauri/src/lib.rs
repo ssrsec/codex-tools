@@ -50,6 +50,7 @@ use models::ApiProxyUsageStats;
 use models::AppSettings;
 use models::AppSettingsPatch;
 use models::AuthJsonImportInput;
+use models::CleanupUnusableAccountsResult;
 use models::CloudflaredStatus;
 use models::CreateApiAccountInput;
 use models::CreateApiProxyKeyInput;
@@ -65,6 +66,7 @@ use models::RemoteServerConfig;
 use models::StartCloudflaredTunnelInput;
 use models::StoredAccount;
 use models::SwitchAccountResult;
+use models::TestAccountStatusResult;
 use models::TestApiAccountConnectionInput;
 use models::TestApiAccountConnectionResult;
 use models::UpdateApiProxyKeyInput;
@@ -75,12 +77,10 @@ use utils::new_background_command;
 
 const OAUTH_CALLBACK_FINISHED_EVENT: &str = "oauth-callback-finished";
 const APP_MENU_OPEN_SETTINGS_EVENT: &str = "app-menu-open-settings";
-const APP_MENU_CHECK_UPDATE_EVENT: &str = "app-menu-check-update";
 const CODEX_COST_ANALYTICS_PROGRESS_EVENT: &str = "codex-cost-analytics-progress";
 const MAIN_WINDOW_VISIBILITY_CHANGED_EVENT: &str = "main-window-visibility-changed";
 const CODEX_COST_ANALYTICS_CACHE_FILE: &str = "codex-cost-analytics-cache.json";
 const APP_MENU_SETTINGS_ID: &str = "app_menu_settings";
-const APP_MENU_CHECK_UPDATES_ID: &str = "app_menu_check_updates";
 #[cfg(not(target_os = "macos"))]
 const BACKGROUND_USAGE_REFRESH_INTERVAL_SECS: u64 = 300;
 const PENDING_AUTH_OPERATION_MESSAGE: &str = "已有账号授权流程正在进行，请先完成或取消后再操作。";
@@ -639,6 +639,18 @@ async fn delete_account(
 }
 
 #[tauri::command]
+async fn cleanup_unusable_accounts(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CleanupUnusableAccountsResult, String> {
+    let result = account_service::cleanup_unusable_accounts_internal(&app, state.inner()).await?;
+    if result.deleted_count > 0 {
+        let _ = tray::refresh_macos_tray_snapshot(&app);
+    }
+    Ok(result)
+}
+
+#[tauri::command]
 async fn update_account_label(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -717,6 +729,22 @@ async fn refresh_all_usage(
 }
 
 #[tauri::command]
+async fn test_account_status(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<TestAccountStatusResult, String> {
+    {
+        let _auth_guard = state.auth_operation_lock.lock().await;
+        ensure_no_pending_auth_operation(state.inner()).await?;
+    }
+    let result = account_service::test_account_status_internal(&app, state.inner(), &id).await?;
+    let summaries = account_service::list_accounts_internal(&app, state.inner()).await?;
+    let _ = tray::update_macos_tray_snapshot(&app, &summaries);
+    Ok(result)
+}
+
+#[tauri::command]
 async fn get_codex_token_usage() -> Result<token_usage::CodexTokenUsageSnapshot, String> {
     tauri::async_runtime::spawn_blocking(token_usage::collect_codex_token_usage_snapshot)
         .await
@@ -726,14 +754,10 @@ async fn get_codex_token_usage() -> Result<token_usage::CodexTokenUsageSnapshot,
 #[tauri::command]
 async fn get_codex_cost_analytics(
     app: AppHandle,
-    state: State<'_, AppState>,
 ) -> Result<token_usage::CodexCostAnalyticsSnapshot, String> {
-    let budget = settings_service::get_app_settings_internal(&app, state.inner())
-        .await?
-        .codex_analytics_weekly_budget_usd;
     let cache_path = codex_cost_analytics_cache_path(&app)?;
     let cached = tauri::async_runtime::spawn_blocking(move || {
-        load_cached_codex_cost_analytics_from_path(&cache_path, budget)
+        load_cached_codex_cost_analytics_from_path(&cache_path)
     })
     .await
     .map_err(|error| format!("读取 Codex 成本分析缓存失败: {error}"))??;
@@ -741,20 +765,16 @@ async fn get_codex_cost_analytics(
         return Ok(cached);
     }
 
-    refresh_codex_cost_analytics_internal(&app, budget, false).await
+    refresh_codex_cost_analytics_internal(&app, false).await
 }
 
 #[tauri::command]
 async fn get_cached_codex_cost_analytics(
     app: AppHandle,
-    state: State<'_, AppState>,
 ) -> Result<Option<token_usage::CodexCostAnalyticsSnapshot>, String> {
-    let budget = settings_service::get_app_settings_internal(&app, state.inner())
-        .await?
-        .codex_analytics_weekly_budget_usd;
     let cache_path = codex_cost_analytics_cache_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        load_cached_codex_cost_analytics_from_path(&cache_path, budget)
+        load_cached_codex_cost_analytics_from_path(&cache_path)
     })
     .await
     .map_err(|error| format!("读取 Codex 成本分析缓存失败: {error}"))?
@@ -763,36 +783,28 @@ async fn get_cached_codex_cost_analytics(
 #[tauri::command]
 async fn refresh_codex_cost_analytics(
     app: AppHandle,
-    state: State<'_, AppState>,
 ) -> Result<token_usage::CodexCostAnalyticsSnapshot, String> {
-    let budget = settings_service::get_app_settings_internal(&app, state.inner())
-        .await?
-        .codex_analytics_weekly_budget_usd;
-    refresh_codex_cost_analytics_internal(&app, budget, true).await
+    refresh_codex_cost_analytics_internal(&app, true).await
 }
 
 #[tauri::command]
 async fn export_codex_cost_analytics(
     app: AppHandle,
-    state: State<'_, AppState>,
     format: String,
 ) -> Result<Option<String>, String> {
     let normalized_format = match format.as_str() {
         "csv" | "json" => format,
         other => return Err(format!("不支持的导出格式: {other}")),
     };
-    let budget = settings_service::get_app_settings_internal(&app, state.inner())
-        .await?
-        .codex_analytics_weekly_budget_usd;
     let cache_path = codex_cost_analytics_cache_path(&app)?;
     let cached = tauri::async_runtime::spawn_blocking(move || {
-        load_cached_codex_cost_analytics_from_path(&cache_path, budget)
+        load_cached_codex_cost_analytics_from_path(&cache_path)
     })
     .await
     .map_err(|error| format!("读取 Codex 成本分析缓存失败: {error}"))??;
     let snapshot = match cached {
         Some(snapshot) => snapshot,
-        None => refresh_codex_cost_analytics_internal(&app, budget, false).await?,
+        None => refresh_codex_cost_analytics_internal(&app, false).await?,
     };
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -806,13 +818,12 @@ async fn export_codex_cost_analytics(
 
 async fn refresh_codex_cost_analytics_internal(
     app: &AppHandle,
-    budget: Option<f64>,
     emit_progress: bool,
 ) -> Result<token_usage::CodexCostAnalyticsSnapshot, String> {
     let cache_path = codex_cost_analytics_cache_path(app)?;
     let progress_app = app.clone();
     let snapshot = tauri::async_runtime::spawn_blocking(move || {
-        token_usage::collect_codex_cost_analytics_snapshot_with_progress(budget, |progress| {
+        token_usage::collect_codex_cost_analytics_snapshot_with_progress(|progress| {
             if emit_progress {
                 let _ = progress_app.emit(CODEX_COST_ANALYTICS_PROGRESS_EVENT, progress);
             }
@@ -961,10 +972,9 @@ fn codex_cost_analytics_cache_path(app: &AppHandle) -> Result<std::path::PathBuf
 
 fn load_cached_codex_cost_analytics_from_path(
     cache_path: &std::path::Path,
-    budget: Option<f64>,
 ) -> Result<Option<token_usage::CodexCostAnalyticsSnapshot>, String> {
     match std::fs::read_to_string(cache_path) {
-        Ok(raw) => token_usage::parse_codex_cost_analytics_cache(&raw, budget),
+        Ok(raw) => token_usage::parse_codex_cost_analytics_cache(&raw),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!(
             "读取成本分析缓存失败 {}: {error}",
@@ -2535,7 +2545,6 @@ fn setup_macos_app_menu(app: &AppHandle) -> Result<(), String> {
     let app_version = package_info.version.to_string();
     let about_label = i18n::app_menu_about(locale, &app_name);
     let settings_label = i18n::app_menu_settings(locale);
-    let check_updates_label = i18n::app_menu_check_updates(locale);
     let about_metadata = AboutMetadata {
         name: Some(app_name.clone()),
         version: Some(app_version.clone()),
@@ -2567,14 +2576,6 @@ fn setup_macos_app_menu(app: &AppHandle) -> Result<(), String> {
                 Some("CmdOrCtrl+,"),
             )
             .map_err(|e| format!("创建设置菜单失败: {e}"))?,
-            &MenuItem::with_id(
-                app,
-                APP_MENU_CHECK_UPDATES_ID,
-                check_updates_label,
-                true,
-                None::<&str>,
-            )
-            .map_err(|e| format!("创建更新菜单失败: {e}"))?,
             &PredefinedMenuItem::separator(app).map_err(|e| format!("创建菜单分隔符失败: {e}"))?,
             &PredefinedMenuItem::services(app, None)
                 .map_err(|e| format!("创建服务菜单失败: {e}"))?,
@@ -2676,12 +2677,6 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         return;
     }
 
-    if id == APP_MENU_CHECK_UPDATES_ID {
-        restore_main_window(app);
-        let _ = app.emit(APP_MENU_CHECK_UPDATE_EVENT, ());
-        return;
-    }
-
     tray::handle_status_bar_menu_event(app, event);
 }
 
@@ -2695,8 +2690,6 @@ pub fn run() {
             restore_main_window(app);
         }))
         .manage(AppState::default())
-        .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -2739,9 +2732,11 @@ pub fn run() {
             import_auth_json_accounts,
             export_accounts_zip,
             delete_account,
+            cleanup_unusable_accounts,
             update_account_label,
             update_account_api_proxy_enabled,
             refresh_all_usage,
+            test_account_status,
             get_codex_token_usage,
             get_codex_cost_analytics,
             get_cached_codex_cost_analytics,

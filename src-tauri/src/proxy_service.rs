@@ -63,7 +63,9 @@ use tauri::AppHandle;
 use crate::app_paths;
 use crate::auth::extract_auth;
 use crate::auth::refresh_chatgpt_auth_tokens;
+use crate::models::account_is_eligible_for_automatic_use;
 use crate::models::normalize_api_proxy_sequential_five_hour_limit_percent;
+use crate::models::plan_type_is_free;
 use crate::models::AccountSourceKind;
 use crate::models::ApiProxyKey;
 use crate::models::ApiProxyKeyUsageLogEntry;
@@ -103,6 +105,12 @@ const DEFAULT_PROXY_REQUEST_BODY_LIMIT_BYTES: usize =
     DEFAULT_PROXY_REQUEST_BODY_LIMIT_MIB * 1024 * 1024;
 const DEFAULT_PROXY_UPSTREAM_TIMEOUT_SECS: u64 = 1_800;
 const DEFAULT_PROXY_CONNECT_TIMEOUT_SECS: u64 = 30;
+const MAX_PROXY_ACCOUNT_ATTEMPTS: usize = 3;
+const PROXY_TRANSPORT_COOLDOWN_SECONDS: i64 = 15;
+const PROXY_RATE_LIMIT_COOLDOWN_SECONDS: i64 = 60;
+const PROXY_PERMISSION_COOLDOWN_SECONDS: i64 = 300;
+const PROXY_QUOTA_COOLDOWN_SECONDS: i64 = 300;
+const PROXY_MODEL_RESTRICTION_COOLDOWN_SECONDS: i64 = 86_400;
 #[cfg(feature = "desktop")]
 const DESKTOP_API_PROXY_BIND_HOST: &str = "0.0.0.0";
 const MAX_PROXY_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
@@ -319,6 +327,7 @@ struct ProxyContext {
     upstream_base_url: String,
     client: reqwest::Client,
     shared: Arc<tokio::sync::Mutex<ApiProxyRuntimeSnapshot>>,
+    account_health: Arc<tokio::sync::Mutex<ProxyAccountHealthRegistry>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -408,7 +417,7 @@ struct ApiProxyHandleState {
     shared: Arc<tokio::sync::Mutex<ApiProxyRuntimeSnapshot>>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RetryFailureCategory {
     QuotaExceeded,
     RateLimited,
@@ -420,6 +429,26 @@ enum RetryFailureCategory {
 struct RetryFailureInfo {
     category: RetryFailureCategory,
     detail: String,
+    permanently_block_account: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ProxyHealthCooldown {
+    until: i64,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProxyAccountHealth {
+    global_cooldown: Option<ProxyHealthCooldown>,
+    model_cooldowns: HashMap<String, ProxyHealthCooldown>,
+    consecutive_transport_failures: u32,
+    last_success_at: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+struct ProxyAccountHealthRegistry {
+    accounts: HashMap<String, ProxyAccountHealth>,
 }
 
 #[derive(Default)]
@@ -884,6 +913,9 @@ pub(crate) async fn start_api_proxy_with_runtime(
         upstream_base_url: resolve_codex_upstream_base_url(),
         client,
         shared: shared.clone(),
+        account_health: Arc::new(tokio::sync::Mutex::new(
+            ProxyAccountHealthRegistry::default(),
+        )),
     });
     let request_body_limit = resolve_proxy_request_body_limit_bytes();
 
@@ -3772,6 +3804,268 @@ fn map_text_settings(root: &mut Map<String, Value>, text: &Value) {
     }
 }
 
+async fn available_proxy_candidates(
+    context: &ProxyContext,
+    candidates: Vec<ProxyCandidate>,
+    requested_model: &str,
+    now: i64,
+) -> Vec<ProxyCandidate> {
+    let mut health = context.account_health.lock().await;
+    candidates
+        .into_iter()
+        .filter(|candidate| health.is_available(&candidate.account_key, requested_model, now))
+        .collect()
+}
+
+impl ProxyAccountHealthRegistry {
+    fn is_available(&mut self, account_key: &str, requested_model: &str, now: i64) -> bool {
+        let Some(account) = self.accounts.get_mut(account_key) else {
+            return true;
+        };
+
+        if account
+            .global_cooldown
+            .as_ref()
+            .is_some_and(|cooldown| cooldown.until <= now)
+        {
+            account.global_cooldown = None;
+        }
+        account
+            .model_cooldowns
+            .retain(|_, cooldown| cooldown.until > now);
+
+        if let Some(cooldown) = account.global_cooldown.as_ref() {
+            log::debug!(
+                "跳过冷却中的代理账号 account_key={} until={} reason={}",
+                account_key,
+                cooldown.until,
+                cooldown.reason
+            );
+            return false;
+        }
+        if let Some(cooldown) = account.model_cooldowns.get(requested_model) {
+            log::debug!(
+                "跳过模型受限的代理账号 account_key={} model={} until={} reason={}",
+                account_key,
+                requested_model,
+                cooldown.until,
+                cooldown.reason
+            );
+            return false;
+        }
+        true
+    }
+
+    fn record_success(&mut self, account_key: &str, requested_model: &str, now: i64) {
+        let account = self.accounts.entry(account_key.to_string()).or_default();
+        account.global_cooldown = None;
+        account.model_cooldowns.remove(requested_model);
+        account.consecutive_transport_failures = 0;
+        account.last_success_at = Some(now);
+    }
+
+    fn record_global_cooldown(&mut self, account_key: &str, until: i64, reason: &str) {
+        let account = self.accounts.entry(account_key.to_string()).or_default();
+        account.global_cooldown = Some(ProxyHealthCooldown {
+            until,
+            reason: reason.to_string(),
+        });
+    }
+
+    fn record_model_cooldown(
+        &mut self,
+        account_key: &str,
+        requested_model: &str,
+        until: i64,
+        reason: &str,
+    ) {
+        let account = self.accounts.entry(account_key.to_string()).or_default();
+        account.model_cooldowns.insert(
+            requested_model.to_string(),
+            ProxyHealthCooldown {
+                until,
+                reason: reason.to_string(),
+            },
+        );
+    }
+
+    fn record_transport_failure(&mut self, account_key: &str, now: i64, reason: &str) {
+        let account = self.accounts.entry(account_key.to_string()).or_default();
+        account.consecutive_transport_failures =
+            account.consecutive_transport_failures.saturating_add(1);
+        let multiplier = i64::from(account.consecutive_transport_failures.clamp(1, 20));
+        account.global_cooldown = Some(ProxyHealthCooldown {
+            until: now.saturating_add(
+                PROXY_TRANSPORT_COOLDOWN_SECONDS
+                    .saturating_mul(multiplier)
+                    .min(PROXY_PERMISSION_COOLDOWN_SECONDS),
+            ),
+            reason: reason.to_string(),
+        });
+    }
+}
+
+async fn record_proxy_account_success(
+    context: &ProxyContext,
+    account_key: &str,
+    requested_model: &str,
+    now: i64,
+) {
+    context
+        .account_health
+        .lock()
+        .await
+        .record_success(account_key, requested_model, now);
+}
+
+async fn record_proxy_global_cooldown(
+    context: &ProxyContext,
+    account_key: &str,
+    until: i64,
+    reason: &str,
+) {
+    context
+        .account_health
+        .lock()
+        .await
+        .record_global_cooldown(account_key, until, reason);
+}
+
+async fn record_proxy_model_cooldown(
+    context: &ProxyContext,
+    account_key: &str,
+    requested_model: &str,
+    until: i64,
+    reason: &str,
+) {
+    context.account_health.lock().await.record_model_cooldown(
+        account_key,
+        requested_model,
+        until,
+        reason,
+    );
+}
+
+async fn record_proxy_transport_failure(
+    context: &ProxyContext,
+    account_key: &str,
+    now: i64,
+    reason: &str,
+) {
+    context
+        .account_health
+        .lock()
+        .await
+        .record_transport_failure(account_key, now, reason);
+}
+
+async fn apply_proxy_failure_health(
+    context: &ProxyContext,
+    candidate: &ProxyCandidate,
+    requested_model: &str,
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &Bytes,
+    failure: &RetryFailureInfo,
+    did_refresh: bool,
+) {
+    let now = now_unix_seconds();
+    let reason = failure.detail.as_str();
+
+    if failure.permanently_block_account || (status == StatusCode::UNAUTHORIZED && did_refresh) {
+        let normalized = if failure.permanently_block_account {
+            "账号被封禁或停用，已自动从代理池排除。"
+        } else {
+            "刷新登录态后仍被上游拒绝，请重新登录授权。"
+        };
+        if let Err(error) = persist_candidate_refresh_state(
+            &context.storage,
+            &candidate.account_key,
+            None,
+            true,
+            Some(normalized),
+        )
+        .await
+        {
+            log::warn!(
+                "持久化代理账号失效状态失败 account_key={}: {}",
+                candidate.account_key,
+                error
+            );
+        }
+        record_proxy_global_cooldown(context, &candidate.account_key, i64::MAX, normalized).await;
+        return;
+    }
+
+    match failure.category {
+        RetryFailureCategory::QuotaExceeded => {
+            let until = quota_cooldown_until(candidate, now)
+                .unwrap_or_else(|| now.saturating_add(PROXY_QUOTA_COOLDOWN_SECONDS));
+            record_proxy_global_cooldown(context, &candidate.account_key, until, reason).await;
+        }
+        RetryFailureCategory::RateLimited => {
+            let until = retry_after_unix_seconds(headers, now)
+                .unwrap_or_else(|| now.saturating_add(PROXY_RATE_LIMIT_COOLDOWN_SECONDS));
+            record_proxy_global_cooldown(context, &candidate.account_key, until, reason).await;
+        }
+        RetryFailureCategory::ModelRestricted => {
+            record_proxy_model_cooldown(
+                context,
+                &candidate.account_key,
+                requested_model,
+                now.saturating_add(PROXY_MODEL_RESTRICTION_COOLDOWN_SECONDS),
+                reason,
+            )
+            .await;
+        }
+        RetryFailureCategory::Authentication | RetryFailureCategory::Permission => {
+            let signals = extract_error_signals(body);
+            let cooldown_seconds = if contains_auth_signal(&signals.normalized) {
+                PROXY_PERMISSION_COOLDOWN_SECONDS
+            } else {
+                PROXY_RATE_LIMIT_COOLDOWN_SECONDS
+            };
+            record_proxy_global_cooldown(
+                context,
+                &candidate.account_key,
+                now.saturating_add(cooldown_seconds),
+                reason,
+            )
+            .await;
+        }
+    }
+}
+
+fn retry_after_unix_seconds(headers: &HeaderMap, now: i64) -> Option<i64> {
+    let seconds = headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())?
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    Some(now.saturating_add(seconds.clamp(1, 3_600)))
+}
+
+fn quota_cooldown_until(candidate: &ProxyCandidate, now: i64) -> Option<i64> {
+    let usage = candidate.usage.as_ref()?;
+    usage
+        .one_week
+        .as_ref()
+        .into_iter()
+        .filter(|window| {
+            finite_used_percent(window).is_some_and(|used_percent| used_percent >= 100.0)
+        })
+        .map(|window| {
+            window.reset_at.unwrap_or_else(|| {
+                usage
+                    .fetched_at
+                    .saturating_add(window.window_seconds.max(0))
+            })
+        })
+        .filter(|reset_at| *reset_at > now)
+        .max()
+}
+
 async fn send_codex_request_over_candidates(
     context: &ProxyContext,
     proxy_key: &ApiProxyKey,
@@ -3806,16 +4100,32 @@ async fn send_codex_request_over_candidates(
         current_sequential_proxy_account_key(context, session_affinity_key).await,
         selection.persisted_sequential_account_key,
     );
-    let candidates = order_proxy_candidates_for_request(
+    let requested_model = api_proxy_usage_model_from_payload(payload);
+    let ordered_candidates = order_proxy_candidates_for_request(
         selection.candidates,
         load_balance,
         current_sequential_account_key.as_deref(),
     );
+    let candidates = available_proxy_candidates(
+        context,
+        ordered_candidates,
+        &requested_model,
+        now_unix_seconds(),
+    )
+    .await;
+    if candidates.is_empty() {
+        let message = "全部代理账号当前均不可用、额度已耗尽或处于冷却期，请稍后重试。";
+        update_proxy_error(context, Some(message.to_string())).await;
+        return Err(json_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            message,
+        ));
+    }
 
     let mut attempt_errors = Vec::new();
     let mut retriable_failures = Vec::new();
 
-    for mut candidate in candidates {
+    for mut candidate in candidates.into_iter().take(MAX_PROXY_ACCOUNT_ATTEMPTS) {
         let mut did_refresh = false;
 
         loop {
@@ -3826,6 +4136,13 @@ async fn send_codex_request_over_candidates(
                 {
                     Ok(response) => response,
                     Err(error) => {
+                        record_proxy_transport_failure(
+                            context,
+                            &candidate.account_key,
+                            now_unix_seconds(),
+                            &error,
+                        )
+                        .await;
                         attempt_errors.push(format!("{}: {}", candidate.label, error));
                         break;
                     }
@@ -3834,6 +4151,13 @@ async fn send_codex_request_over_candidates(
             let status = upstream.status();
             log_proxy_response_route(route, status);
             if status.is_success() {
+                record_proxy_account_success(
+                    context,
+                    &candidate.account_key,
+                    &requested_model,
+                    now_unix_seconds(),
+                )
+                .await;
                 record_api_proxy_call_success(context, proxy_key, &candidate, route, payload).await;
                 if matches!(load_balance.mode, ApiProxyLoadBalanceMode::Sequential) {
                     bind_sequential_session_proxy_account(
@@ -3858,6 +4182,16 @@ async fn send_codex_request_over_candidates(
 
             if !did_refresh && should_retry_with_token_refresh(status, &upstream_body) {
                 if candidate.auth_refresh_blocked {
+                    record_proxy_global_cooldown(
+                        context,
+                        &candidate.account_key,
+                        i64::MAX,
+                        candidate
+                            .auth_refresh_error
+                            .as_deref()
+                            .unwrap_or("工具保存的授权快照已失效，请重新登录授权。"),
+                    )
+                    .await;
                     attempt_errors.push(format!(
                         "{}: {}",
                         candidate.label,
@@ -3874,6 +4208,13 @@ async fn send_codex_request_over_candidates(
                         continue;
                     }
                     Err(error) => {
+                        record_proxy_transport_failure(
+                            context,
+                            &candidate.account_key,
+                            now_unix_seconds(),
+                            &format!("刷新登录态失败: {error}"),
+                        )
+                        .await;
                         attempt_errors
                             .push(format!("{}: 刷新登录态失败: {}", candidate.label, error));
                         break;
@@ -3882,6 +4223,17 @@ async fn send_codex_request_over_candidates(
             }
 
             if let Some(failure) = classify_retriable_failure(status, &upstream_body) {
+                apply_proxy_failure_health(
+                    context,
+                    &candidate,
+                    &requested_model,
+                    status,
+                    &upstream_headers,
+                    &upstream_body,
+                    &failure,
+                    did_refresh,
+                )
+                .await;
                 retriable_failures.push(failure);
                 break;
             }
@@ -4385,11 +4737,21 @@ fn normalize_api_proxy_reasoning_effort_for_upstream(value: &str) -> Result<Stri
 }
 
 fn account_to_proxy_candidate(account: StoredAccount) -> Option<ProxyCandidate> {
-    if !account.api_proxy_enabled {
+    account_to_proxy_candidate_at(account, now_unix_seconds())
+}
+
+fn account_to_proxy_candidate_at(account: StoredAccount, now: i64) -> Option<ProxyCandidate> {
+    if !account.api_proxy_enabled || !account_is_eligible_for_automatic_use(&account, now) {
         return None;
     }
 
     let extracted = extract_auth(&account.auth_json).ok()?;
+    let plan_type = account
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.plan_type.clone())
+        .or(account.plan_type.clone())
+        .or(extracted.plan_type);
     let account_key = account.account_key();
     let variant_key = account.variant_key();
     Some(ProxyCandidate {
@@ -4400,14 +4762,9 @@ fn account_to_proxy_candidate(account: StoredAccount) -> Option<ProxyCandidate> 
         access_token: extracted.access_token,
         auth_json: account.auth_json,
         variant_key,
-        plan_type: account
-            .usage
-            .as_ref()
-            .and_then(|usage| usage.plan_type.clone())
-            .or(account.plan_type)
-            .or(extracted.plan_type),
+        plan_type,
         usage: account.usage,
-        auth_refresh_blocked: account.auth_refresh_blocked,
+        auth_refresh_blocked: false,
         auth_refresh_error: account.auth_refresh_error,
         updated_at: account.updated_at,
     })
@@ -4509,7 +4866,7 @@ fn sequential_switch_rank(candidate: &ProxyCandidate, current_key: &str, limit_p
 }
 
 fn is_under_sequential_limit(candidate: &ProxyCandidate, limit_percent: f64) -> bool {
-    five_hour_used_percent(candidate)
+    active_window_used_percent(candidate)
         .map(|used_percent| used_percent < limit_percent)
         .unwrap_or(true)
 }
@@ -4520,7 +4877,9 @@ fn compare_proxy_candidates(left: &ProxyCandidate, right: &ProxyCandidate) -> Or
         ordering => return ordering,
     }
 
-    match is_free_plan(&right.plan_type).cmp(&is_free_plan(&left.plan_type)) {
+    match plan_type_is_free(left.plan_type.as_deref())
+        .cmp(&plan_type_is_free(right.plan_type.as_deref()))
+    {
         Ordering::Equal => {}
         ordering => return ordering,
     }
@@ -4535,21 +4894,6 @@ fn compare_proxy_candidates(left: &ProxyCandidate, right: &ProxyCandidate) -> Or
             .usage
             .as_ref()
             .and_then(|usage| usage.one_week.as_ref()),
-    )) {
-        Ordering::Equal => {}
-        ordering => return ordering,
-    }
-
-    match usage_window_used_percent(
-        left.usage
-            .as_ref()
-            .and_then(|usage| usage.five_hour.as_ref()),
-    )
-    .total_cmp(&usage_window_used_percent(
-        right
-            .usage
-            .as_ref()
-            .and_then(|usage| usage.five_hour.as_ref()),
     )) {
         Ordering::Equal => {}
         ordering => return ordering,
@@ -4560,18 +4904,11 @@ fn compare_proxy_candidates(left: &ProxyCandidate, right: &ProxyCandidate) -> Or
         .then_with(|| left.account_key.cmp(&right.account_key))
 }
 
-fn is_free_plan(plan_type: &Option<String>) -> bool {
-    plan_type
-        .as_deref()
-        .map(|value| value.eq_ignore_ascii_case("free"))
-        .unwrap_or(false)
-}
-
-fn five_hour_used_percent(candidate: &ProxyCandidate) -> Option<f64> {
+fn active_window_used_percent(candidate: &ProxyCandidate) -> Option<f64> {
     candidate
         .usage
         .as_ref()
-        .and_then(|usage| usage.five_hour.as_ref())
+        .and_then(|usage| usage.one_week.as_ref())
         .and_then(finite_used_percent)
 }
 
@@ -4795,12 +5132,14 @@ fn should_retry_with_token_refresh(status: StatusCode, body: &Bytes) -> bool {
 
 fn classify_retriable_failure(status: StatusCode, body: &Bytes) -> Option<RetryFailureInfo> {
     let signals = extract_error_signals(body);
+    let permanently_block_account = contains_deactivated_signal(&signals.normalized);
 
     if matches!(status, StatusCode::PAYMENT_REQUIRED) || contains_quota_signal(&signals.normalized)
     {
         return Some(RetryFailureInfo {
             category: RetryFailureCategory::QuotaExceeded,
             detail: format!("额度用完：{}", signals.brief),
+            permanently_block_account,
         });
     }
 
@@ -4808,6 +5147,7 @@ fn classify_retriable_failure(status: StatusCode, body: &Bytes) -> Option<RetryF
         return Some(RetryFailureInfo {
             category: RetryFailureCategory::ModelRestricted,
             detail: format!("模型受限：{}", signals.brief),
+            permanently_block_account,
         });
     }
 
@@ -4815,13 +5155,18 @@ fn classify_retriable_failure(status: StatusCode, body: &Bytes) -> Option<RetryF
         return Some(RetryFailureInfo {
             category: RetryFailureCategory::RateLimited,
             detail: format!("频率限制：{}", signals.brief),
+            permanently_block_account,
         });
     }
 
-    if status == StatusCode::UNAUTHORIZED || contains_auth_signal(&signals.normalized) {
+    if status == StatusCode::UNAUTHORIZED
+        || contains_auth_signal(&signals.normalized)
+        || permanently_block_account
+    {
         return Some(RetryFailureInfo {
             category: RetryFailureCategory::Authentication,
             detail: format!("鉴权失败：{}", signals.brief),
+            permanently_block_account,
         });
     }
 
@@ -4829,10 +5174,20 @@ fn classify_retriable_failure(status: StatusCode, body: &Bytes) -> Option<RetryF
         return Some(RetryFailureInfo {
             category: RetryFailureCategory::Permission,
             detail: format!("权限不足：{}", signals.brief),
+            permanently_block_account,
         });
     }
 
     None
+}
+
+fn contains_deactivated_signal(text: &str) -> bool {
+    text.contains("your openai account has been deactivated")
+        || text.contains("account has been deactivated")
+        || text.contains("account deactivated")
+        || text.contains("deactivated_user")
+        || text.contains("deactivated_workspace")
+        || (text.contains("deactivated") && text.contains("check your email"))
 }
 
 struct ErrorSignals {
@@ -7437,6 +7792,7 @@ fn parse_proxy_request_body_limit_mib(value: Option<&str>) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::account_to_proxy_candidate;
+    use super::account_to_proxy_candidate_at;
     use super::api_proxy_disabled_model_set;
     use super::api_proxy_requested_models_from_payload;
     use super::api_proxy_usage_bucket_seconds;
@@ -7570,6 +7926,47 @@ mod tests {
         }
     }
 
+    fn stored_proxy_account(
+        id: &str,
+        plan_type: &str,
+        usage: Option<UsageSnapshot>,
+    ) -> StoredAccount {
+        StoredAccount {
+            id: id.to_string(),
+            label: id.to_string(),
+            source_kind: Default::default(),
+            principal_id: Some(format!("{id}@example.com")),
+            email: Some(format!("{id}@example.com")),
+            account_id: id.to_string(),
+            plan_type: Some(plan_type.to_string()),
+            auth_json: json!({
+                "tokens": {
+                    "access_token": "token",
+                    "id_token": "header.e30.signature",
+                    "account_id": id,
+                }
+            }),
+            api_base_url: None,
+            api_key: None,
+            model_name: None,
+            balance_text: None,
+            profile_auth_path: None,
+            profile_config_path: None,
+            profile_auth_ready: false,
+            profile_config_ready: false,
+            profile_integrity_error: None,
+            profile_last_validated_at: None,
+            profile_last_validation_error: None,
+            added_at: 1,
+            updated_at: 1,
+            usage,
+            usage_error: None,
+            auth_refresh_blocked: false,
+            auth_refresh_error: None,
+            api_proxy_enabled: true,
+        }
+    }
+
     fn load_balance_config(
         mode: ApiProxyLoadBalanceMode,
         sequential_limit: f64,
@@ -7646,36 +8043,47 @@ mod tests {
 
     #[test]
     fn disabled_account_is_not_proxy_candidate() {
-        let account = StoredAccount {
-            id: "disabled".to_string(),
-            label: "disabled".to_string(),
-            source_kind: Default::default(),
-            principal_id: Some("disabled@example.com".to_string()),
-            email: Some("disabled@example.com".to_string()),
-            account_id: "account-1".to_string(),
-            plan_type: Some("team".to_string()),
-            auth_json: json!({}),
-            api_base_url: None,
-            api_key: None,
-            model_name: None,
-            balance_text: None,
-            profile_auth_path: None,
-            profile_config_path: None,
-            profile_auth_ready: false,
-            profile_config_ready: false,
-            profile_integrity_error: None,
-            profile_last_validated_at: None,
-            profile_last_validation_error: None,
-            added_at: 1,
-            updated_at: 1,
-            usage: None,
-            usage_error: None,
-            auth_refresh_blocked: false,
-            auth_refresh_error: None,
-            api_proxy_enabled: false,
-        };
+        let mut account = stored_proxy_account("disabled", "team", None);
+        account.api_proxy_enabled = false;
 
         assert!(account_to_proxy_candidate(account).is_none());
+    }
+
+    #[test]
+    fn blocked_and_free_accounts_are_not_proxy_candidates() {
+        let mut blocked = stored_proxy_account("blocked", "team", None);
+        blocked.auth_refresh_blocked = true;
+        let free = stored_proxy_account("free", "free", None);
+
+        assert!(account_to_proxy_candidate_at(blocked, 100).is_none());
+        assert!(account_to_proxy_candidate_at(free, 100).is_none());
+    }
+
+    #[test]
+    fn actively_exhausted_account_is_excluded_until_reset() {
+        let usage = UsageSnapshot {
+            fetched_at: 100,
+            plan_type: Some("team".to_string()),
+            five_hour: None,
+            one_week: Some(UsageWindow {
+                used_percent: 100.0,
+                window_seconds: 604_800,
+                reset_at: Some(200),
+            }),
+            credits: None,
+            reset_credits: None,
+        };
+
+        assert!(account_to_proxy_candidate_at(
+            stored_proxy_account("exhausted", "team", Some(usage.clone())),
+            150,
+        )
+        .is_none());
+        assert!(account_to_proxy_candidate_at(
+            stored_proxy_account("reset", "team", Some(usage)),
+            201,
+        )
+        .is_some());
     }
 
     #[test]
@@ -8098,7 +8506,7 @@ mod tests {
     }
 
     #[test]
-    fn average_load_balance_preserves_free_plan_then_usage_order() {
+    fn average_load_balance_places_paid_accounts_before_free_and_blocked_accounts() {
         let candidates = vec![
             proxy_candidate_with_plan("free weekly 95", "e", Some(95.0), Some(95.0), false, "free"),
             proxy_candidate("weekly 20", "a", Some(20.0), Some(5.0), false),
@@ -8116,13 +8524,54 @@ mod tests {
         assert_eq!(
             candidate_labels(&ordered),
             vec![
-                "free weekly 95",
                 "weekly 10 five 5",
                 "weekly 10 five 90",
                 "weekly 20",
+                "free weekly 95",
                 "blocked low usage",
             ]
         );
+    }
+
+    #[test]
+    fn proxy_health_cooldowns_are_scoped_and_expire() {
+        let mut health = super::ProxyAccountHealthRegistry::default();
+        health.record_model_cooldown("account-a", "gpt-5.6", 200, "model restricted");
+
+        assert!(!health.is_available("account-a", "gpt-5.6", 150));
+        assert!(health.is_available("account-a", "gpt-5.5", 150));
+        assert!(health.is_available("account-a", "gpt-5.6", 201));
+
+        health.record_global_cooldown("account-a", 300, "rate limited");
+        assert!(!health.is_available("account-a", "gpt-5.5", 250));
+        assert!(health.is_available("account-a", "gpt-5.5", 301));
+    }
+
+    #[test]
+    fn quota_cooldown_uses_the_active_quota_window_reset() {
+        let mut candidate = proxy_candidate("quota", "account-a", Some(100.0), Some(100.0), false);
+        let usage = candidate.usage.as_mut().expect("usage");
+        usage.one_week.as_mut().expect("one week").reset_at = Some(300);
+        usage.five_hour.as_mut().expect("legacy five hour").reset_at = Some(400);
+
+        assert_eq!(super::quota_cooldown_until(&candidate, 100), Some(300));
+    }
+
+    #[test]
+    fn deactivated_upstream_error_permanently_blocks_account() {
+        let failure = super::classify_retriable_failure(
+            axum::http::StatusCode::FORBIDDEN,
+            &axum::body::Bytes::from(
+                r#"{"error":{"message":"Your OpenAI account has been deactivated. Check your email."}}"#,
+            ),
+        )
+        .expect("deactivated response should be retriable through another account");
+
+        assert_eq!(
+            failure.category,
+            super::RetryFailureCategory::Authentication
+        );
+        assert!(failure.permanently_block_account);
     }
 
     #[test]
@@ -8253,10 +8702,10 @@ mod tests {
     }
 
     #[test]
-    fn sequential_load_balance_reuses_current_candidate_with_missing_five_hour_usage() {
+    fn sequential_load_balance_reuses_current_candidate_under_weekly_limit() {
         let candidates = vec![
             proxy_candidate("smart best", "a", Some(5.0), Some(10.0), false),
-            proxy_candidate("current missing 5h", "b", Some(50.0), None, false),
+            proxy_candidate("current", "b", Some(50.0), None, false),
         ];
 
         let ordered = order_proxy_candidates_for_request(
@@ -8265,14 +8714,11 @@ mod tests {
             Some("b"),
         );
 
-        assert_eq!(
-            candidate_labels(&ordered),
-            vec!["current missing 5h", "smart best"]
-        );
+        assert_eq!(candidate_labels(&ordered), vec!["current", "smart best"]);
     }
 
     #[test]
-    fn sequential_load_balance_keeps_current_first_when_all_five_hour_usage_is_missing() {
+    fn sequential_load_balance_keeps_current_first_with_only_weekly_usage() {
         let candidates = vec![
             proxy_candidate("missing a", "a", Some(5.0), None, false),
             proxy_candidate("current missing", "b", Some(50.0), None, false),
@@ -8291,8 +8737,8 @@ mod tests {
     #[test]
     fn sequential_load_balance_switches_when_current_reaches_limit() {
         let candidates = vec![
-            proxy_candidate("current at limit", "a", Some(1.0), Some(80.0), false),
-            proxy_candidate("next under limit", "b", Some(20.0), Some(10.0), false),
+            proxy_candidate("current at limit", "a", Some(80.0), Some(1.0), false),
+            proxy_candidate("next under limit", "b", Some(20.0), Some(90.0), false),
             proxy_candidate("blocked", "c", Some(0.0), Some(0.0), true),
         ];
 

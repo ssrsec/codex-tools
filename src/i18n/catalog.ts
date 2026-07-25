@@ -59,8 +59,6 @@ export type MessageCatalog = {
   topBar: {
     appTitle: string;
     logoAlt: string;
-    checkUpdate: string;
-    checkingUpdate: string;
     manualRefresh: string;
     refreshing: string;
     openSettings: string;
@@ -84,6 +82,8 @@ export type MessageCatalog = {
   };
   addAccount: {
     smartSwitch: string;
+    cleanupUnavailable: string;
+    cleaningUnavailable: string;
     exportButton: string;
     startButton: string;
     dialogAriaLabel: string;
@@ -239,16 +239,6 @@ export type MessageCatalog = {
     heatmapTooltip: (weekday: string, time: string, tokens: string) => string;
     topPromptsTitle: string;
     topPromptsDescription: string;
-    budgetTitle: string;
-    budgetDescription: string;
-    budgetInputLabel: string;
-    budgetPlaceholder: string;
-    budgetSave: string;
-    budgetClear: string;
-    budgetUnset: string;
-    budgetOk: string;
-    budgetWarning: string;
-    budgetDanger: string;
     pricingEstimate: string;
     costSourceLocal: string;
     sourceFiles: string;
@@ -596,39 +586,13 @@ export type MessageCatalog = {
     placeholder: string;
   };
   editorAppLabels: Record<string, string>;
-  updateDialog: {
-    ariaLabel: string;
-    title: (version: string) => string;
-    subtitle: (currentVersion: string) => string;
-    close: string;
-    publishedAt: (date: string) => string;
-    statusReady: string;
-    statusInstalling: string;
-    manualDownload: string;
-    skipThisVersion: string;
-    installNow: string;
-    installingNow: string;
-    changelogTitle: string;
-    changelogEmpty: string;
-  };
   notices: {
     settingsUpdated: string;
     updateSettingsFailed: (error: string) => string;
     usageRefreshed: string;
     refreshFailed: (error: string) => string;
     reloginRequired: (label: string) => string;
-    preparingUpdateDownload: string;
-    alreadyLatest: string;
-    updateDownloadStarted: string;
-    updateDownloadingPercent: (percent: number) => string;
-    updateDownloading: string;
-    updateDownloadFinished: string;
-    updateInstalling: string;
-    updateInstallFailed: (error: string) => string;
-    foundNewVersion: (version: string, currentVersion: string) => string;
-    updateCheckFailed: (error: string) => string;
     openExternalFailed: (error: string) => string;
-    openManualDownloadFailed: (error: string) => string;
     oauthLinkPrepareFailed: (error: string) => string;
     oauthImportPrefix: string;
     currentAccountImportSuccess: string;
@@ -646,6 +610,13 @@ export type MessageCatalog = {
     deleteConfirm: (label: string) => string;
     accountDeleted: string;
     deleteFailed: (error: string) => string;
+    testAccountHealthy: (label: string) => string;
+    testAccountUnavailable: (label: string, message: string) => string;
+    testAccountFailed: (error: string) => string;
+    cleanupUnavailableConfirm: (count: number) => string;
+    cleanupUnavailableDone: (count: number, skipped: number) => string;
+    cleanupUnavailableEmpty: string;
+    cleanupUnavailableFailed: (error: string) => string;
     accountAlreadyCurrent: string;
     switchedOnly: string;
     switchedAndLaunchByCli: string;
@@ -799,14 +770,6 @@ function compileLocale(raw: RawMessageCatalog): MessageCatalog {
     settings: raw.settings,
     editorPicker: raw.editorPicker,
     editorAppLabels: raw.editorAppLabels,
-    updateDialog: {
-      ...raw.updateDialog,
-      title: (version) => fillTemplate(raw.updateDialog.title, { version }),
-      subtitle: (currentVersion) =>
-        fillTemplate(raw.updateDialog.subtitle, { currentVersion }),
-      publishedAt: (date) =>
-        fillTemplate(raw.updateDialog.publishedAt, { date }),
-    },
     notices: {
       ...raw.notices,
       updateSettingsFailed: (error) =>
@@ -815,18 +778,8 @@ function compileLocale(raw: RawMessageCatalog): MessageCatalog {
         fillTemplate(raw.notices.refreshFailed, { error }),
       reloginRequired: (label) =>
         fillTemplate(raw.notices.reloginRequired, { label }),
-      updateDownloadingPercent: (percent) =>
-        fillTemplate(raw.notices.updateDownloadingPercent, { percent }),
-      updateInstallFailed: (error) =>
-        fillTemplate(raw.notices.updateInstallFailed, { error }),
-      foundNewVersion: (version, currentVersion) =>
-        fillTemplate(raw.notices.foundNewVersion, { version, currentVersion }),
-      updateCheckFailed: (error) =>
-        fillTemplate(raw.notices.updateCheckFailed, { error }),
       openExternalFailed: (error) =>
         fillTemplate(raw.notices.openExternalFailed, { error }),
-      openManualDownloadFailed: (error) =>
-        fillTemplate(raw.notices.openManualDownloadFailed, { error }),
       oauthLinkPrepareFailed: (error) =>
         fillTemplate(raw.notices.oauthLinkPrepareFailed, { error }),
       currentAccountImportFailed: (error) =>
@@ -853,6 +806,18 @@ function compileLocale(raw: RawMessageCatalog): MessageCatalog {
         fillTemplate(raw.notices.deleteConfirm, { label }),
       deleteFailed: (error) =>
         fillTemplate(raw.notices.deleteFailed, { error }),
+      testAccountHealthy: (label) =>
+        fillTemplate(raw.notices.testAccountHealthy, { label }),
+      testAccountUnavailable: (label, message) =>
+        fillTemplate(raw.notices.testAccountUnavailable, { label, message }),
+      testAccountFailed: (error) =>
+        fillTemplate(raw.notices.testAccountFailed, { error }),
+      cleanupUnavailableConfirm: (count) =>
+        fillTemplate(raw.notices.cleanupUnavailableConfirm, { count }),
+      cleanupUnavailableDone: (count, skipped) =>
+        fillTemplate(raw.notices.cleanupUnavailableDone, { count, skipped }),
+      cleanupUnavailableFailed: (error) =>
+        fillTemplate(raw.notices.cleanupUnavailableFailed, { error }),
       providerSyncFailed: (base, error) =>
         fillTemplate(raw.notices.providerSyncFailed, { base, error }),
       opencodeSyncFailed: (base, error) =>

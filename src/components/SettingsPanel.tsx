@@ -33,8 +33,6 @@ function GitHubIcon() {
 type SettingsPanelProps = {
   themeMode: ThemeMode;
   onToggleTheme: () => void;
-  checkingUpdate: boolean;
-  onCheckUpdate: () => void;
   onOpenExternalUrl: (url: string) => void;
   settings: AppSettings;
   installedEditorApps: InstalledEditorApp[];
@@ -46,8 +44,6 @@ type SettingsPanelProps = {
 export function SettingsPanel({
   themeMode,
   onToggleTheme,
-  checkingUpdate,
-  onCheckUpdate,
   onOpenExternalUrl,
   settings,
   installedEditorApps,
@@ -162,18 +158,18 @@ export function SettingsPanel({
                   {copy.settings.trayUsageDisplay.used}
                 </button>
                 <button
-                  className={settings.trayUsageDisplayMode === "fiveHourRemaining" ? "primary" : "ghost"}
-                  disabled={savingSettings}
-                  onClick={() => onUpdateSettings({ trayUsageDisplayMode: "fiveHourRemaining" })}
-                  aria-pressed={settings.trayUsageDisplayMode === "fiveHourRemaining"}
-                >
-                  {copy.settings.trayUsageDisplay.fiveHourRemaining}
-                </button>
-                <button
-                  className={settings.trayUsageDisplayMode === "oneWeekRemaining" ? "primary" : "ghost"}
+                  className={
+                    settings.trayUsageDisplayMode === "oneWeekRemaining" ||
+                    settings.trayUsageDisplayMode === "fiveHourRemaining"
+                      ? "primary"
+                      : "ghost"
+                  }
                   disabled={savingSettings}
                   onClick={() => onUpdateSettings({ trayUsageDisplayMode: "oneWeekRemaining" })}
-                  aria-pressed={settings.trayUsageDisplayMode === "oneWeekRemaining"}
+                  aria-pressed={
+                    settings.trayUsageDisplayMode === "oneWeekRemaining" ||
+                    settings.trayUsageDisplayMode === "fiveHourRemaining"
+                  }
                 >
                   {copy.settings.trayUsageDisplay.oneWeekRemaining}
                 </button>
@@ -409,11 +405,6 @@ export function SettingsPanel({
             <div className="settingMeta settingMetaInline">
               <strong>{copy.settings.projectInfo.versionLabel}</strong>
               <span className="settingInlineValue">{versionValue}</span>
-            </div>
-            <div className="settingActionGroup">
-              <button className="primary" onClick={onCheckUpdate} disabled={checkingUpdate}>
-                {checkingUpdate ? copy.topBar.checkingUpdate : copy.topBar.checkUpdate}
-              </button>
             </div>
           </div>
 

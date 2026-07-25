@@ -2,52 +2,55 @@
   <h1>Codex Tools</h1>
   <p><strong>Codex 多账号管理、CLI/TUI 切换、用量查看和本地 OpenAI 兼容 API 反代工具。</strong></p>
   <p>
-    <a href="https://github.com/170-carry/codex-tools/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/170-carry/codex-tools?label=release"></a>
-    <a href="https://www.npmjs.com/package/@170-carry/ctc"><img alt="npm" src="https://img.shields.io/npm/v/@170-carry/ctc?label=npm"></a>
-    <a href="https://github.com/170-carry/codex-tools/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue"></a>
+    <a href="https://github.com/ssrsec/codex-tools/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/ssrsec/codex-tools?label=release"></a>
+    <a href="https://www.npmjs.com/package/@ssrsec/ctc"><img alt="npm" src="https://img.shields.io/npm/v/@ssrsec/ctc?label=npm"></a>
+    <a href="https://github.com/ssrsec/codex-tools/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue"></a>
     <img alt="Platforms" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey">
   </p>
 </div>
 
-## Overview
+> [!IMPORTANT]
+> 本仓库基于 [170-carry/codex-tools](https://github.com/170-carry/codex-tools) 开源项目开发，遵循原项目的 MIT 许可证。当前版本由 [ssrsec/codex-tools](https://github.com/ssrsec/codex-tools) 独立维护，后续功能、修复、Issue 和 Release 均以本仓库为准，不再自动跟随原仓库更新。
 
-Codex Tools 面向同时使用多个 Codex 账号的场景，提供桌面 GUI、命令行入口和本地 `/v1` 反代能力。你可以用它导入账号、查看用量、切换本机 Codex 登录态，也可以把账号池暴露成 OpenAI 兼容接口供 Cursor、ChatWise、CC Switch、本地脚本等工具调用。
+## 项目简介
 
-## Contents
+Codex Tools 面向同时使用多个 Codex 账号的场景，提供桌面 GUI、CLI/TUI 和本地 `/v1` 反代能力。你可以导入账号、检测账号健康状态、查看一周额度与有效 Token、切换本机 Codex 登录态，也可以把健康账号池暴露成 OpenAI 兼容接口供 Cursor、ChatWise、CC Switch、本地脚本等工具调用。
 
-- [Highlights](#highlights)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [CLI Reference](#cli-reference)
-- [API Proxy](#api-proxy)
-- [Development](#development)
-- [Release](#release)
-- [Documentation](#documentation)
-- [Troubleshooting](#troubleshooting)
+## 目录
 
-## Highlights
+- [主要功能](#主要功能)
+- [安装](#安装)
+- [快速开始](#快速开始)
+- [CLI 命令](#cli-命令)
+- [API 反代](#api-反代)
+- [开发](#开发)
+- [发布](#发布)
+- [文档](#文档)
+- [常见问题](#常见问题)
+- [项目来源与许可](#项目来源与许可)
 
-- 多账号管理：OAuth 登录导入、JSON 批量导入、账号备份回导入。
-- 用量查看：展示 `5h`、`1week` 用量窗口和账号计划类型。
+## 主要功能
+
+- 多账号管理：OAuth 登录导入、JSON 批量导入、账号备份与回导入。
+- 健康检测：识别授权失效、账号停用、Free 套餐、额度耗尽与临时检测失败，支持单账号检测和一键清理确定不可用账号。
+- 用量查看：展示当前一周额度、订阅到期、下次重置、有效 Token 与平均周使用率。
 - 快速切换：切换 `~/.codex/auth.json` 和 `config.toml`，可联动启动新版 ChatGPT App，并兼容旧 Codex App 与 `codex app` 回退。
 - CLI/TUI：通过 `ctc` 执行 `list/switch/login/import/export/usage/provider/doctor/report/tui`。
-- API 反代：本地提供 OpenAI 兼容 `/v1` 接口，支持运行中账号轮换。
+- API 反代：本地提供 OpenAI 兼容 `/v1` 接口，自动排除不可用账号，并支持请求失败后的冷却、重试和运行中账号轮换。
 - App/CLI 绑定：可一键把 Codex App/CLI 切到本机反代地址，也可一键恢复原配置。
+- 用量分析：按主会话统计有效 Token、项目、会话、Prompt 和七日热力图，并按官方标准 API 费率给出等价成本估算。
 - 公网访问：集成 cloudflared，支持快速隧道和命名隧道。
-- 桌面能力：状态栏驻留、自动更新、多语言界面、编辑器联动。
+- 桌面能力：状态栏驻留、多语言界面、编辑器联动。
+- 更新方式：应用不包含自动更新器，新版本请从本仓库 Releases 下载。
 
-## Preview
-
-![Codex Tools Screenshot](public/ScreenShot.png)
-
-## Installation
+## 安装
 
 ### CLI/TUI
 
 推荐通过 npm 安装命令行入口：
 
 ```bash
-npm i -g @170-carry/ctc
+npm i -g @ssrsec/ctc
 ```
 
 安装后使用：
@@ -63,24 +66,24 @@ ctc ui
 不想全局安装时，可以直接运行：
 
 ```bash
-npx @170-carry/ctc list --json
+npx @ssrsec/ctc list --json
 ```
 
 `ctc ui` 会打开本机已安装的 Codex Tools 桌面应用；npm 包负责安装命令行入口和原生 CLI，不负责安装 `.app` 或 `.exe` 桌面包。
 
-### Desktop App
+### 桌面应用
 
 桌面应用从 GitHub Releases 下载：
 
-- [Latest Release](https://github.com/170-carry/codex-tools/releases/latest)
+- [下载最新版本](https://github.com/ssrsec/codex-tools/releases/latest)
 - macOS Apple Silicon / Intel
 - Windows x64
 
 安装桌面应用后，可以直接在 GUI 内完成账号导入、用量刷新、切换、API 反代和 cloudflared 配置。
 
-## Quick Start
+## 快速开始
 
-### Terminal
+### 终端
 
 ```bash
 ctc login --label work
@@ -98,15 +101,16 @@ ctc doctor --json
 4. 用 `ctc provider sync` 修复 Codex 历史 provider 元数据。
 5. 用 `ctc doctor` 检查本机环境和账号库状态。
 
-### Desktop
+### 桌面应用
 
 1. 打开 Codex Tools。
 2. 导入一个或多个 Codex 账号。
-3. 刷新账号用量。
-4. 选择账号并切换，或启动本地 API 反代。
-5. 需要公网访问时，再开启 cloudflared。
+3. 刷新用量，查看账号状态、一周额度、订阅信息和下次重置时间。
+4. 对有疑问的账号单独执行状态检测，确定不可用时可使用一键清理。
+5. 选择可用账号切换，或启动会自动过滤异常账号的本地 API 反代。
+6. 需要公网访问时，再开启 cloudflared。
 
-## CLI Reference
+## CLI 命令
 
 所有命令默认读取桌面应用相同的数据目录。需要隔离环境时，加 `--data-dir <目录>`。
 
@@ -134,21 +138,21 @@ ctc doctor --json
 
 `ctc provider sync` 会在 `~/.codex/backups_state/provider-sync/` 下生成备份；包含 `encrypted_content` 的历史会恢复列表可见性，但跨 provider 继续 resume 仍可能受 Codex 加密上下文限制。
 
-## API Proxy
+## API 反代
 
 Codex Tools 可以启动本地 OpenAI 兼容反代：
 
 - 默认地址：`http://127.0.0.1:8787/v1`
 - 鉴权方式：应用内生成的 `sk-...` API Key
 - 上游来源：已导入的 Codex 账号
-- 账号选择：按可用额度自动选择，支持运行中切换
+- 账号选择：自动排除授权失效、Free、额度耗尽及冷却中的账号，按当前一周额度选择并支持运行中切换
 - 默认模型：`gpt-5.6-sol`
 - 默认推理：`xhigh` + `fast`
 - GPT-5.6 模型：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`
 
 更多链路说明见 [docs/api-proxy.md](docs/api-proxy.md)。
 
-### Local Clients
+### 本地客户端
 
 本地脚本、`curl`、ChatWise 等本机直连客户端，可以直接使用本地 `Base URL`：
 
@@ -183,7 +187,7 @@ GPT-5.6 可用推理强度为 `none`、`low`、`medium`、`high`、`xhigh`、`ma
 
 反代面板也提供“切到本机反代”和“恢复正常地址”按钮，会自动备份并恢复 `~/.codex/config.toml` 与 `~/.codex/auth.json`。
 
-### Anthropic Messages
+### Anthropic Messages 兼容
 
 兼容 Anthropic Messages 的客户端可以请求：
 
@@ -193,35 +197,35 @@ GPT-5.6 可用推理强度为 `none`、`low`、`medium`、`high`、`xhigh`、`ma
 
 这里的 `2023-06-01` 是 Anthropic API version，不是模型版本日期。
 
-## Development
+## 开发
 
-### Requirements
+### 环境要求
 
 - Node.js 20+
 - Rust stable
 - macOS 或 Windows
 
-### Run Locally
+### 本地运行
 
 ```bash
 npm install
 npm run tauri dev
 ```
 
-### Build CLI
+### 构建 CLI
 
 ```bash
 cd src-tauri
 cargo build --bin codex-tools-cli
 ```
 
-### Build Frontend
+### 构建前端
 
 ```bash
 npm run build
 ```
 
-## Release
+## 发布
 
 本仓库使用 GitHub Actions 自动发布桌面安装包和 npm CLI 包。
 
@@ -237,26 +241,28 @@ git push origin v<version>
 - macOS Apple Silicon 桌面安装包
 - macOS Intel 桌面安装包
 - Windows x64 桌面安装包
-- npm wrapper：`@170-carry/ctc`
-- npm native packages：`@170-carry/ctc-darwin-arm64`、`@170-carry/ctc-darwin-x64`、`@170-carry/ctc-win32-x64`
+- npm wrapper：`@ssrsec/ctc`
+- npm native packages：`@ssrsec/ctc-darwin-arm64`、`@ssrsec/ctc-darwin-x64`、`@ssrsec/ctc-win32-x64`
 
 npm 发布需要在 GitHub repository secrets 中配置 `NPM_TOKEN`。
 
-## Documentation
+应用已移除内置自动更新器和签名密钥依赖。用户通过本仓库 Releases 或 npm 获取新版本。
 
-- [How to Use](how%20to%20use.md)
-- [API Proxy](docs/api-proxy.md)
+## 文档
+
+- [使用说明](how%20to%20use.md)
+- [API 反代说明](docs/api-proxy.md)
 - [Linux Proxyd](docs/linux-proxyd.md)
-- [Changelog](changelog.md)
+- [更新日志](changelog.md)
 
-## Troubleshooting
+## 常见问题
 
 ### npm 安装后缺少原生包
 
 如果安装时禁用了 optional dependencies，可能会看到缺少平台包的提示。重新安装：
 
 ```bash
-npm i -g @170-carry/ctc --include=optional
+npm i -g @ssrsec/ctc --include=optional
 ```
 
 ### macOS 提示应用已损坏
@@ -272,7 +278,7 @@ sudo xattr -r -d com.apple.quarantine /Applications/Codex\ Tools.app
 
 如果 Cursor 返回 `ssrf_blocked`，说明它的请求侧无法访问本机私网地址。请使用 cloudflared、远程 Linux 反代或公网域名。
 
-## Project Layout
+## 项目结构
 
 ```text
 src/                     React frontend
@@ -283,16 +289,19 @@ docs/                    Extra documentation
 .github/workflows/       Release workflows
 ```
 
-## Star History
+## Star 历史
 
-<a href="https://www.star-history.com/?repos=170-carry/codex-tools&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=ssrsec/codex-tools&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=170-carry/codex-tools&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=170-carry/codex-tools&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=170-carry/codex-tools&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=ssrsec/codex-tools&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=ssrsec/codex-tools&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=ssrsec/codex-tools&type=date&legend=top-left" />
  </picture>
 </a>
 
-## License
+## 项目来源与许可
 
-MIT，详见 [LICENSE](LICENSE)。
+- 原始项目：[170-carry/codex-tools](https://github.com/170-carry/codex-tools)
+- 当前独立维护仓库：[ssrsec/codex-tools](https://github.com/ssrsec/codex-tools)
+- 本仓库不会自动同步原仓库；如需引入上游变更，会先独立审查和测试。
+- 项目继续使用 MIT 许可证，原作者版权与许可声明予以保留，详见 [LICENSE](LICENSE)。

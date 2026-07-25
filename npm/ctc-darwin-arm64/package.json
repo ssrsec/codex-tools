@@ -1,12 +1,12 @@
 {
-  "name": "@170-carry/ctc-darwin-arm64",
+  "name": "@ssrsec/ctc-darwin-arm64",
   "version": "2.4.0",
   "description": "Codex Tools native CLI for macOS Apple Silicon",
   "license": "MIT",
-  "homepage": "https://github.com/170-carry/codex-tools",
+  "homepage": "https://github.com/ssrsec/codex-tools",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/170-carry/codex-tools.git"
+    "url": "git+https://github.com/ssrsec/codex-tools.git"
   },
   "publishConfig": {
     "access": "public"

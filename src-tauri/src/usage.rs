@@ -275,14 +275,15 @@ fn map_usage_payload(
     payload: UsageApiResponse,
     reset_credits: Option<ResetCreditsSnapshot>,
 ) -> UsageSnapshot {
-    let mut windows: Vec<UsageWindowRaw> = Vec::new();
+    let mut primary_windows: Vec<UsageWindowRaw> = Vec::new();
+    let mut fallback_windows: Vec<UsageWindowRaw> = Vec::new();
 
     if let Some(rate_limit) = payload.rate_limit {
         if let Some(primary) = rate_limit.primary_window {
-            windows.push(primary);
+            primary_windows.push(primary);
         }
         if let Some(secondary) = rate_limit.secondary_window {
-            windows.push(secondary);
+            primary_windows.push(secondary);
         }
     }
 
@@ -290,23 +291,26 @@ fn map_usage_payload(
         for limit in additional {
             if let Some(rate_limit) = limit.rate_limit {
                 if let Some(primary) = rate_limit.primary_window {
-                    windows.push(primary);
+                    fallback_windows.push(primary);
                 }
                 if let Some(secondary) = rate_limit.secondary_window {
-                    windows.push(secondary);
+                    fallback_windows.push(secondary);
                 }
             }
         }
     }
 
-    let five_hour = pick_nearest_window(&windows, 5 * 60 * 60).map(to_usage_window);
-    let one_week = pick_nearest_window(&windows, 7 * 24 * 60 * 60).map(to_usage_window);
+    // Codex 已不再提供旧的 5 小时额度。保留 five_hour 字段仅用于读取旧缓存，
+    // 新快照只写入服务端返回的主额度窗口，避免把唯一的 7 天窗口复制成“5h + 1w”。
+    let active_window = longest_window(&primary_windows)
+        .or_else(|| longest_window(&fallback_windows))
+        .map(to_usage_window);
 
     UsageSnapshot {
         fetched_at: now_unix_seconds(),
         plan_type: payload.plan_type,
-        five_hour,
-        one_week,
+        five_hour: None,
+        one_week: active_window,
         credits: payload.credits.map(|credit| CreditSnapshot {
             has_credits: credit.has_credits,
             unlimited: credit.unlimited,
@@ -401,10 +405,10 @@ fn normalize_epoch_seconds(value: i64) -> i64 {
     }
 }
 
-fn pick_nearest_window(windows: &[UsageWindowRaw], target_seconds: i64) -> Option<UsageWindowRaw> {
+fn longest_window(windows: &[UsageWindowRaw]) -> Option<UsageWindowRaw> {
     windows
         .iter()
-        .min_by_key(|window| (window.limit_window_seconds - target_seconds).abs())
+        .max_by_key(|window| window.limit_window_seconds)
         .map(|window| UsageWindowRaw {
             used_percent: window.used_percent,
             limit_window_seconds: window.limit_window_seconds,
@@ -423,6 +427,10 @@ fn to_usage_window(window: UsageWindowRaw) -> UsageWindow {
 #[cfg(test)]
 mod tests {
     use super::map_reset_credits_payload;
+    use super::map_usage_payload;
+    use super::RateLimitDetails;
+    use super::UsageApiResponse;
+    use super::UsageWindowRaw;
     use serde_json::json;
 
     #[test]
@@ -464,5 +472,38 @@ mod tests {
         assert_eq!(snapshot.available_count, Some(1));
         assert_eq!(snapshot.credits[0].granted_at, Some(1_797_392_400));
         assert_eq!(snapshot.credits[0].expires_at, None);
+    }
+
+    #[test]
+    fn usage_payload_keeps_single_week_window_without_fabricating_five_hour_usage() {
+        let snapshot = map_usage_payload(
+            UsageApiResponse {
+                plan_type: Some("plus".to_string()),
+                rate_limit: Some(RateLimitDetails {
+                    primary_window: Some(UsageWindowRaw {
+                        used_percent: 42.0,
+                        limit_window_seconds: 604_800,
+                        reset_at: 1_800_000_000,
+                    }),
+                    secondary_window: None,
+                }),
+                additional_rate_limits: None,
+                credits: None,
+            },
+            None,
+        );
+
+        assert!(snapshot.five_hour.is_none());
+        assert_eq!(
+            snapshot
+                .one_week
+                .as_ref()
+                .map(|window| window.window_seconds),
+            Some(604_800)
+        );
+        assert_eq!(
+            snapshot.one_week.as_ref().map(|window| window.used_percent),
+            Some(42.0)
+        );
     }
 }

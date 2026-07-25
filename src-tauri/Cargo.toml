@@ -4,7 +4,7 @@ version = "2.4.0"
 description = "Codex Tools"
 authors = ["you"]
 license = "MIT"
-repository = "https://github.com/170-carry/codex-tools"
+repository = "https://github.com/ssrsec/codex-tools"
 edition = "2021"
 rust-version = "1.77.2"
 default-run = "app"
@@ -41,8 +41,6 @@ sha2 = "0.10"
 constant_time_eq = "0.3"
 time = { version = "0.3", features = ["formatting", "local-offset", "parsing"] }
 clap = { version = "4.5", features = ["derive"] }
-tauri-plugin-process = "2"
-tauri-plugin-updater = "2"
 tauri-plugin-autostart = "2"
 axum = { version = "0.7", features = ["multipart", "ws"] }
 async-stream = "0.3"

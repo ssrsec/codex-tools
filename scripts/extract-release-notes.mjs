@@ -31,17 +31,11 @@ let notesSource = "version";
 if (!body && unreleasedBody) {
   body = unreleasedBody;
   notesSource = "unreleased";
-  emitWarning(
-    `No release-note entry matches ${releaseTag}; using optional Unreleased notes. / ` +
-      `没有与 ${releaseTag} 对应的更新说明，将使用可选的 Unreleased 内容。`,
-  );
+  emitWarning(`没有与 ${releaseTag} 对应的版本日志，将使用“未发布”内容。`);
 } else if (!body) {
   body = createGenericReleaseBody(releaseTag);
   notesSource = "generated";
-  emitWarning(
-    `No optional release notes were found for ${releaseTag}; using generated generic text. ` +
-      `The build and release will continue. / 未找到 ${releaseTag} 的可选更新说明，将使用自动生成的通用文字；构建和发布将继续。`,
-  );
+  emitWarning(`未找到 ${releaseTag} 的更新日志，将使用自动生成的通用说明；发布不会中断。`);
 }
 
 if (writeGithubOutput) {
@@ -72,17 +66,6 @@ function readOptionalChangelog(path) {
 
 function createGenericReleaseBody(tag) {
   return [
-    "## English",
-    "",
-    `Release ${tag}`,
-    "",
-    "Build matrix includes:",
-    "- macOS Apple Silicon (aarch64)",
-    "- macOS Intel (x86_64)",
-    "- Windows",
-    "",
-    "## 中文",
-    "",
     `发布 ${tag}`,
     "",
     "构建平台包括：",
@@ -95,11 +78,11 @@ function createGenericReleaseBody(tag) {
 function emitWarning(message) {
   if (writeGithubOutput) {
     process.stdout.write(
-      `::warning title=Optional release notes / 可选更新说明::${escapeWorkflowCommand(message)}\n`,
+      `::warning title=更新日志::${escapeWorkflowCommand(message)}\n`,
     );
     return;
   }
-  process.stderr.write(`[release-notes] Warning: ${message}\n`);
+  process.stderr.write(`[更新日志] 警告：${message}\n`);
 }
 
 function escapeWorkflowCommand(value) {
@@ -153,15 +136,7 @@ function extractUnreleasedEntry(changelogLines) {
 }
 
 function normalizeReleaseBody(entryLines) {
-  const bodyLines = entryLines.map((line) => {
-    if (/^\s*####\s+English\s*$/i.test(line)) {
-      return "## English";
-    }
-    if (/^\s*####\s+中文\s*$/.test(line)) {
-      return "## 中文";
-    }
-    return line.trimEnd();
-  });
+  const bodyLines = entryLines.map((line) => line.trimEnd());
 
   while (bodyLines[0]?.trim().length === 0) {
     bodyLines.shift();

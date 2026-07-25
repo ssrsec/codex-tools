@@ -2,8 +2,7 @@
   min-height: 0;
   height: 100%;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) clamp(470px, 32vw, 500px);
-  gap: 16px;
+  grid-template-columns: minmax(0, 1fr);
   overflow: hidden;
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--line) 78%, var(--subtle) 22%) transparent;
@@ -54,7 +53,7 @@
 
 .accountToolbar {
   display: grid;
-  grid-template-columns: minmax(220px, 260px) auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(220px, 1fr) auto auto;
   gap: 10px;
   align-items: center;
   padding: 12px 16px;
@@ -135,15 +134,16 @@
 }
 
 .accountToolbarActions .importSmartSwitch,
+.accountToolbarActions .importCleanup,
 .accountToolbarActions .importPrimary {
-  min-width: 112px;
+  min-width: 106px;
   min-height: 40px;
   padding: 0 14px;
   font-size: 0.78rem;
 }
 
 .accountListFrame {
-  --account-row-columns: minmax(260px, 1.5fr) minmax(108px, 0.66fr) minmax(108px, 0.66fr) minmax(96px, 0.56fr) 50px minmax(106px, auto);
+  --account-row-columns: minmax(290px, 1.7fr) minmax(145px, 0.85fr) minmax(118px, 0.68fr) minmax(130px, 0.72fr) 64px minmax(112px, auto);
   min-height: 0;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
@@ -253,7 +253,7 @@ button.accountTokenExportButton {
   position: sticky;
   top: 0;
   z-index: 2;
-  display: none;
+  display: grid;
   grid-template-columns: var(--account-row-columns);
   gap: 8px;
   align-items: center;
@@ -404,41 +404,49 @@ button.accountTokenExportButton {
 .accountIdentityText {
   min-width: 0;
   display: grid;
-  gap: 4px;
+  gap: 3px;
 }
 
 .accountTitleLine {
   min-width: 0;
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  display: flex;
   align-items: center;
   gap: 7px;
 }
 
-.accountNameButton {
+.accountAddressButton {
   min-width: 0;
-  width: 100%;
-  min-height: 24px;
+  width: max-content;
+  max-width: 100%;
+  min-height: 18px;
   border: 0;
-  border-radius: 6px;
+  border-radius: 5px;
   padding: 0;
   justify-content: start;
+  color: var(--subtle);
   background: transparent;
   box-shadow: none;
-  color: var(--ink);
-  font: 800 0.9rem/1.15 var(--font-ui);
+  font: 650 0.68rem/1.1 var(--font-ui);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   text-align: left;
 }
 
-.accountNameButton:hover,
-.accountNameButton:focus-visible {
+.accountPrimaryAddress {
+  flex: 1 1 120px;
+  width: 100%;
+  min-height: 24px;
+  color: var(--ink);
+  font: 800 0.86rem/1.15 var(--font-ui);
+}
+
+.accountAddressButton:hover,
+.accountAddressButton:focus-visible {
   transform: none;
+  color: var(--brand);
   background: transparent;
   box-shadow: none;
-  color: var(--brand);
 }
 
 .planChip {
@@ -522,19 +530,17 @@ button.accountTokenExportButton {
   min-width: 0;
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 6px 8px;
 }
 
 .accountStateLine > .statusText {
-  flex: 0 0 7.5rem;
-}
-
-:root:lang(zh-CN) .accountStateLine > .statusText {
-  flex-basis: 4.5rem;
+  flex: 1 1 auto;
+  overflow: hidden;
 }
 
 .usageFreshnessBadge {
+  flex: 0 1 auto;
   min-width: 0;
   max-width: 100%;
   min-height: 20px;
@@ -594,6 +600,7 @@ button.accountTokenExportButton {
 }
 
 .statusReason {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -626,6 +633,10 @@ button.accountTokenExportButton {
   background: #b91c1c;
 }
 
+.statusText.status-checkFailed .statusDot {
+  background: #7c3aed;
+}
+
 .statusText.status-issue .statusDot {
   background: #e11d48;
 }
@@ -646,6 +657,10 @@ button.accountTokenExportButton {
   background: #b91c1c;
 }
 
+.statusDot.status-checkFailed {
+  background: #7c3aed;
+}
+
 .statusDot.status-issue {
   background: #e11d48;
 }
@@ -664,6 +679,10 @@ button.accountTokenExportButton {
 
 .statusText.status-exhausted {
   color: #b91c1c;
+}
+
+.statusText.status-checkFailed {
+  color: #7c3aed;
 }
 
 .statusText.status-issue {
@@ -724,11 +743,13 @@ button.accountTokenExportButton {
   white-space: nowrap;
 }
 
+.dateCell,
 .resetCell {
   display: grid;
   gap: 6px;
 }
 
+.dateCell strong,
 .resetCell span,
 .resetCell strong {
   color: var(--ink);
@@ -736,6 +757,7 @@ button.accountTokenExportButton {
   white-space: nowrap;
 }
 
+.dateCell strong,
 .resetCell strong {
   color: var(--subtle);
   font-weight: 650;

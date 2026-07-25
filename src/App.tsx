@@ -7,19 +7,16 @@ import { AddAccountSection } from "./components/AddAccountSection";
 import { AddAccountDialog } from "./components/AddAccountDialog";
 import { AccountsGrid } from "./components/AccountsGrid";
 import { AppTopBar } from "./components/AppTopBar";
-import { DebugFloatingTool } from "./components/DebugFloatingTool";
 import { DeleteAccountDialog } from "./components/DeleteAccountDialog";
 import { MetaStrip } from "./components/MetaStrip";
 import { NoticeBanner } from "./components/NoticeBanner";
 import { RemoteDeployProgressToast } from "./components/RemoteDeployProgressToast";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { UpdateBanner } from "./components/UpdateBanner";
 import { useCodexController } from "./hooks/useCodexController";
 import { useThemeMode } from "./hooks/useThemeMode";
 
 type AppTab = "accounts" | "analytics" | "proxy" | "settings";
 const APP_MENU_OPEN_SETTINGS_EVENT = "app-menu-open-settings";
-const APP_MENU_CHECK_UPDATE_EVENT = "app-menu-check-update";
 const TOKEN_USAGE_FRESHNESS_MS = 5 * 60 * 1000;
 
 function App() {
@@ -45,16 +42,12 @@ function App() {
     exportingAccounts,
     authBusy,
     switchingId,
-    renamingAccountId,
+    testingAccountId,
+    cleaningUnavailableAccounts,
+    cleanupUnavailableCount,
     pendingDeleteId,
     deleteCandidate,
     deletingAccountId,
-    checkingUpdate,
-    installingUpdate,
-    updateProgress,
-    pendingUpdate,
-    updateDialogOpen,
-    skipPendingUpdateVersion,
     notice,
     openExternalUrl,
     settings,
@@ -100,11 +93,6 @@ function App() {
     refreshCostAnalytics,
     exportCostAnalytics,
     onDeleteCodexSession,
-    checkForAppUpdate,
-    installPendingUpdate,
-    openDebugUpdateDialog,
-    openManualDownloadPage,
-    closeUpdateDialog,
     updateSettings,
     onOpenAddDialog,
     onReauthorizeAccount,
@@ -141,9 +129,10 @@ function App() {
     onInstallCloudflared,
     onStartCloudflared,
     onStopCloudflared,
-    onRenameAccountLabel,
     onToggleAccountApiProxy,
     onDelete,
+    onTestAccountStatus,
+    onCleanupUnavailableAccounts,
     onCancelDelete,
     onConfirmDelete,
     onSwitch,
@@ -188,20 +177,12 @@ function App() {
             setActiveTab("settings");
           },
         );
-        const checkUpdateUnlisten = await listen<void>(
-          APP_MENU_CHECK_UPDATE_EVENT,
-          () => {
-            void checkForAppUpdate(false);
-          },
-        );
-
         if (disposed) {
           void openSettingsUnlisten();
-          void checkUpdateUnlisten();
           return;
         }
 
-        unlistenFns.push(openSettingsUnlisten, checkUpdateUnlisten);
+        unlistenFns.push(openSettingsUnlisten);
       } catch {
         // The app can still run in a browser-only preview where Tauri events are unavailable.
       }
@@ -215,7 +196,7 @@ function App() {
         void unlisten();
       }
     };
-  }, [checkForAppUpdate]);
+  }, []);
 
   useEffect(() => {
     if (activeTab !== "accounts" || !mainWindowVisible) {
@@ -283,17 +264,6 @@ function App() {
 
         <NoticeBanner notice={notice} />
         <RemoteDeployProgressToast progress={remoteDeployProgress} />
-        <DebugFloatingTool onOpenUpdateDialog={openDebugUpdateDialog} />
-        <UpdateBanner
-          open={updateDialogOpen}
-          pendingUpdate={pendingUpdate}
-          updateProgress={updateProgress}
-          installingUpdate={installingUpdate}
-          onClose={closeUpdateDialog}
-          onManualDownload={() => void openManualDownloadPage()}
-          onSkipVersion={() => void skipPendingUpdateVersion()}
-          onInstallNow={() => void installPendingUpdate()}
-        />
 
         <section className="viewStage">
           {activeTab === "accounts" ? (
@@ -302,6 +272,7 @@ function App() {
                 leadingContent={
                   <MetaStrip
                     accounts={accounts}
+                    refreshError={usageRefreshError}
                     exportingAccounts={exportingAccounts}
                     onExportAccounts={() => void onExportAccounts()}
                   />
@@ -310,7 +281,12 @@ function App() {
                   <AddAccountSection
                     onOpenAddDialog={onOpenAddDialog}
                     onSmartSwitch={() => void onSmartSwitch()}
+                    onCleanupUnavailable={() =>
+                      void onCleanupUnavailableAccounts()
+                    }
                     smartSwitching={smartSwitching}
+                    cleaningUnavailable={cleaningUnavailableAccounts}
+                    cleanupUnavailableCount={cleanupUnavailableCount}
                   />
                 }
                 accounts={accounts}
@@ -323,14 +299,12 @@ function App() {
                 exportingAccounts={exportingAccounts}
                 authBusy={authBusy}
                 switchingId={switchingId}
-                renamingAccountId={renamingAccountId}
+                testingAccountId={testingAccountId}
                 pendingDeleteId={pendingDeleteId}
                 onExportAll={() => void onExportAccounts()}
                 onExport={(account) => void onExportAccounts(account)}
                 onReauthorize={(account) => void onReauthorizeAccount(account)}
-                onRename={(account, label) =>
-                  onRenameAccountLabel(account, label)
-                }
+                onTestStatus={(account) => onTestAccountStatus(account)}
                 onToggleApiProxy={(account, enabled) =>
                   onToggleAccountApiProxy(account, enabled)
                 }
@@ -345,19 +319,9 @@ function App() {
               loading={costAnalyticsLoading}
               exporting={costAnalyticsExporting}
               progress={costAnalyticsProgress}
-              weeklyBudgetUsd={settings.codexAnalyticsWeeklyBudgetUsd}
-              savingSettings={savingSettings}
               onRefresh={() => void refreshCostAnalytics(false)}
               onExport={(format) => void exportCostAnalytics(format)}
               onDeleteSession={(session) => void onDeleteCodexSession(session)}
-              onUpdateWeeklyBudget={(value) =>
-                updateSettings(
-                  { codexAnalyticsWeeklyBudgetUsd: value },
-                  { silent: true, keepInteractive: true },
-                ).then(async () => {
-                  await loadCostAnalytics(true);
-                })
-              }
             />
           ) : activeTab === "proxy" ? (
             <ApiProxyPanel
@@ -463,8 +427,6 @@ function App() {
             <SettingsPanel
               themeMode={themeMode}
               onToggleTheme={toggleTheme}
-              checkingUpdate={checkingUpdate}
-              onCheckUpdate={() => void checkForAppUpdate(false)}
               onOpenExternalUrl={(url) => void openExternalUrl(url)}
               settings={settings}
               installedEditorApps={installedEditorApps}

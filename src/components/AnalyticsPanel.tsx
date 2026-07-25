@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n/I18nProvider";
 import { tokenHeatmapLevel } from "../utils/heatmapScale";
 import type {
-  CodexBudgetAlert,
   CodexCostAnalyticsProgress,
   CodexCostAnalyticsSnapshot,
   CodexHourlyCostBucket,
@@ -17,12 +16,9 @@ type AnalyticsPanelProps = {
   loading: boolean;
   exporting: "csv" | "json" | null;
   progress: CodexCostAnalyticsProgress | null;
-  weeklyBudgetUsd: number | null;
-  savingSettings: boolean;
   onRefresh: () => void;
   onExport: (format: "csv" | "json") => void;
   onDeleteSession: (session: CodexSessionCostBreakdown) => Promise<void> | void;
-  onUpdateWeeklyBudget: (value: number | null) => Promise<void>;
 };
 
 type AnalyticsCopy = ReturnType<typeof useI18n>["copy"]["analytics"];
@@ -91,22 +87,6 @@ function formatDuration(seconds: number | null, locale: string) {
     return new Intl.NumberFormat(locale).format(minutes) + "m";
   }
   return `${new Intl.NumberFormat(locale).format(hours)}h ${minutes}m`;
-}
-
-function alertLabel(
-  alert: CodexBudgetAlert,
-  copy: ReturnType<typeof useI18n>["copy"]["analytics"],
-) {
-  if (alert === "danger") {
-    return copy.budgetDanger;
-  }
-  if (alert === "warning") {
-    return copy.budgetWarning;
-  }
-  if (alert === "ok") {
-    return copy.budgetOk;
-  }
-  return copy.budgetUnset;
 }
 
 function statCard(
@@ -362,16 +342,12 @@ export function AnalyticsPanel({
   loading,
   exporting,
   progress,
-  weeklyBudgetUsd,
-  savingSettings,
   onRefresh,
   onExport,
   onDeleteSession,
-  onUpdateWeeklyBudget,
 }: AnalyticsPanelProps) {
   const { copy, locale } = useI18n();
   const text = copy.analytics;
-  const budgetInputRef = useRef<HTMLInputElement | null>(null);
   const deleteConfirmTimerRef = useRef<number | null>(null);
   const [sessionQuery, setSessionQuery] = useState("");
   const [pendingDeleteSessionId, setPendingDeleteSessionId] = useState<
@@ -380,9 +356,6 @@ export function AnalyticsPanel({
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(
     null,
   );
-  const budgetInputValue =
-    weeklyBudgetUsd === null ? "" : String(weeklyBudgetUsd);
-
   const normalizedQuery = sessionQuery.trim().toLocaleLowerCase();
   const filteredSessions = useMemo(() => {
     const sessions = analytics?.sessions ?? [];
@@ -402,22 +375,6 @@ export function AnalyticsPanel({
         .includes(normalizedQuery),
     );
   }, [analytics?.sessions, normalizedQuery]);
-
-  const saveBudget = () => {
-    const trimmed = budgetInputRef.current?.value.trim() ?? "";
-    const value = trimmed === "" ? null : Number(trimmed);
-    if (value !== null && (!Number.isFinite(value) || value <= 0)) {
-      return;
-    }
-    void onUpdateWeeklyBudget(value);
-  };
-
-  const clearBudget = () => {
-    if (budgetInputRef.current) {
-      budgetInputRef.current.value = "";
-    }
-    void onUpdateWeeklyBudget(null);
-  };
 
   const clearDeleteConfirmTimer = () => {
     if (deleteConfirmTimerRef.current !== null) {
@@ -462,7 +419,6 @@ export function AnalyticsPanel({
     [],
   );
 
-  const budgetPercent = analytics?.weeklyBudgetPercent ?? null;
   const costSource = costSourceDetail(analytics, text, locale);
   const hasData = analytics !== null && analytics.eventCount > 0;
   const showProgress = loading || progress !== null;
@@ -562,55 +518,6 @@ export function AnalyticsPanel({
             analytics ? formatNumber(analytics.sessions.length, locale) : "--",
             text.sourceFiles,
           )}
-        </section>
-
-        <section
-          className={`analyticsBudget tone-${analytics?.weeklyBudgetAlert ?? "none"}`}
-        >
-          <div>
-            <span>{text.budgetTitle}</span>
-            <strong>
-              {analytics
-                ? alertLabel(analytics.weeklyBudgetAlert, text)
-                : text.budgetUnset}
-            </strong>
-            <p>{text.budgetDescription}</p>
-          </div>
-          <div className="analyticsBudgetMeter" aria-hidden="true">
-            <i
-              style={{
-                width: `${Math.min(100, Math.max(0, budgetPercent ?? 0))}%`,
-              }}
-            />
-          </div>
-          <label>
-            <span>{text.budgetInputLabel}</span>
-            <input
-              key={budgetInputValue}
-              ref={budgetInputRef}
-              defaultValue={budgetInputValue}
-              inputMode="decimal"
-              placeholder={text.budgetPlaceholder}
-            />
-          </label>
-          <div className="analyticsBudgetActions">
-            <button
-              type="button"
-              className="ghost"
-              onClick={clearBudget}
-              disabled={savingSettings}
-            >
-              {text.budgetClear}
-            </button>
-            <button
-              type="button"
-              className="primary"
-              onClick={saveBudget}
-              disabled={savingSettings}
-            >
-              {text.budgetSave}
-            </button>
-          </div>
         </section>
 
         {loading && !analytics ? (

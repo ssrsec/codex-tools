@@ -52,14 +52,17 @@ export type CodexTokenUsageSnapshot = {
   unresolvedForkCount: number;
   unresolvedUsageEventCount: number;
   eventCount: number;
+  excludedAgentSessionCount: number;
+  last24hEffectiveTokens: number;
+  last3dEffectiveTokens: number;
+  last7dEffectiveTokens: number;
+  last30dEffectiveTokens: number;
   last24h: CodexTokenTotals;
   last3d: CodexTokenTotals;
   last7d: CodexTokenTotals;
   last30d: CodexTokenTotals;
   latestSession: CodexTokenSessionUsage | null;
 };
-
-export type CodexBudgetAlert = "none" | "ok" | "warning" | "danger";
 
 export type CodexProjectCostBreakdown = {
   projectPath: string;
@@ -121,6 +124,7 @@ export type CodexCostAnalyticsSnapshot = {
   failedPathCount: number;
   unresolvedForkCount: number;
   unresolvedUsageEventCount: number;
+  excludedAgentSessionCount: number;
   eventCount: number;
   total: CodexTokenTotals;
   totalCostUsd: number;
@@ -128,14 +132,9 @@ export type CodexCostAnalyticsSnapshot = {
   last7d: CodexTokenTotals;
   last7dCostUsd: number;
   localLast7dCostUsd: number;
-  budgetPeriodCostUsd: number;
-  localBudgetPeriodCostUsd: number;
   costSource: "local_estimate" | string;
   costSourceUpdatedAt: number | null;
   costSourceError: string | null;
-  weeklyBudgetUsd: number | null;
-  weeklyBudgetPercent: number | null;
-  weeklyBudgetAlert: CodexBudgetAlert;
   projects: CodexProjectCostBreakdown[];
   sessions: CodexSessionCostBreakdown[];
   heatmap: CodexHourlyCostBucket[];
@@ -177,6 +176,18 @@ export type AccountSummary = {
   authRefreshError: string | null;
   apiProxyEnabled: boolean;
   isCurrent: boolean;
+};
+
+export type TestAccountStatusResult = {
+  account: AccountSummary;
+  ok: boolean;
+  message: string;
+};
+
+export type CleanupUnusableAccountsResult = {
+  deletedIds: string[];
+  deletedCount: number;
+  skippedCurrentCount: number;
 };
 
 export type SwitchAccountResult = {
@@ -403,14 +414,6 @@ export type Notice = {
   message: string;
 };
 
-export type PendingUpdateInfo = {
-  currentVersion: string;
-  version: string;
-  body?: string;
-  date?: string;
-  debugPreview?: boolean;
-};
-
 export type ThemeMode = "light" | "dark";
 
 export type TrayUsageDisplayMode = "remaining" | "used" | "fiveHourRemaining" | "oneWeekRemaining" | "hidden";
@@ -449,10 +452,8 @@ export type AppSettings = {
   apiProxyLoadBalanceMode: ApiProxyLoadBalanceMode;
   apiProxySequentialFiveHourLimitPercent: number;
   apiProxyDisabledModels: string[];
-  codexAnalyticsWeeklyBudgetUsd: number | null;
   remoteServers: RemoteServerConfig[];
   locale: AppLocale;
-  skippedUpdateVersion: string | null;
 };
 
 export type UpdateSettingsOptions = {

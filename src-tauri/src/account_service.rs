@@ -31,14 +31,19 @@ use crate::auth::refresh_chatgpt_auth_tokens;
 use crate::auth::write_active_codex_auth;
 use crate::models::dedupe_account_variants;
 use crate::models::mark_current_account_summary;
+use crate::models::plan_type_is_free;
+use crate::models::usage_error_indicates_authorization_failure;
+use crate::models::usage_has_active_exhausted_window;
 use crate::models::AccountSourceKind;
 use crate::models::AccountSummary;
 use crate::models::AccountsStore;
 use crate::models::AuthJsonImportInput;
+use crate::models::CleanupUnusableAccountsResult;
 use crate::models::CreateApiAccountInput;
 use crate::models::ImportAccountFailure;
 use crate::models::ImportAccountsResult;
 use crate::models::StoredAccount;
+use crate::models::TestAccountStatusResult;
 use crate::models::TestApiAccountConnectionInput;
 use crate::models::TestApiAccountConnectionResult;
 use crate::models::UsageSnapshot;
@@ -422,6 +427,48 @@ pub(crate) async fn delete_account_internal(
     Ok(())
 }
 
+pub(crate) async fn cleanup_unusable_accounts_internal(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<CleanupUnusableAccountsResult, String> {
+    let _guard = state.store_lock.lock().await;
+    let mut store = load_store(app)?;
+    let current_account_key = current_auth_account_key();
+    let active_account_id = store.settings.active_account_id.clone();
+    let mut deleted_ids = Vec::new();
+    let mut skipped_current_count = 0usize;
+
+    store.accounts.retain(|account| {
+        let definitely_unusable = account.auth_refresh_blocked
+            || usage_error_indicates_authorization_failure(account.usage_error.as_deref())
+            || (matches!(account.source_kind, AccountSourceKind::Chatgpt)
+                && plan_type_is_free(account.resolved_plan_type().as_deref()));
+        if !definitely_unusable {
+            return true;
+        }
+
+        let is_current = active_account_id.as_deref() == Some(account.id.as_str())
+            || current_account_key.as_deref() == Some(account.account_key().as_str());
+        if is_current {
+            skipped_current_count += 1;
+            return true;
+        }
+
+        deleted_ids.push(account.id.clone());
+        false
+    });
+
+    if !deleted_ids.is_empty() {
+        save_store(app, &store)?;
+    }
+    let deleted_count = deleted_ids.len();
+    Ok(CleanupUnusableAccountsResult {
+        deleted_ids,
+        deleted_count,
+        skipped_current_count,
+    })
+}
+
 pub(crate) async fn update_account_label_internal(
     app: &AppHandle,
     state: &AppState,
@@ -521,6 +568,15 @@ pub(crate) async fn refresh_all_usage_internal(
     state: &AppState,
     force_auth_refresh: bool,
 ) -> Result<Vec<AccountSummary>, String> {
+    refresh_usage_internal(app, state, force_auth_refresh, None).await
+}
+
+async fn refresh_usage_internal(
+    app: &AppHandle,
+    state: &AppState,
+    force_auth_refresh: bool,
+    target_account_key: Option<&str>,
+) -> Result<Vec<AccountSummary>, String> {
     let current_auth_override: Option<(String, serde_json::Value)> =
         read_current_codex_auth_optional()
             .ok()
@@ -534,11 +590,14 @@ pub(crate) async fn refresh_all_usage_internal(
                 })
             });
 
-    let refresh_targets: Vec<RefreshTarget> = {
+    let mut refresh_targets: Vec<RefreshTarget> = {
         let _guard = state.store_lock.lock().await;
         let store = load_store(app)?;
         build_refresh_targets(store.accounts, current_auth_override.as_ref())
     };
+    if let Some(target_account_key) = target_account_key {
+        refresh_targets.retain(|target| target.account_key == target_account_key);
+    }
 
     let outcomes =
         refresh_usage_targets_with_workers(app, state, refresh_targets, force_auth_refresh).await;
@@ -670,6 +729,133 @@ pub(crate) async fn refresh_all_usage_internal(
     );
 
     Ok(summaries)
+}
+
+pub(crate) async fn test_account_status_internal(
+    app: &AppHandle,
+    state: &AppState,
+    id: &str,
+) -> Result<TestAccountStatusResult, String> {
+    let (account_key, source_kind, relay_input) = {
+        let _guard = state.store_lock.lock().await;
+        let store = load_store(app)?;
+        let account = store
+            .accounts
+            .iter()
+            .find(|account| account.id == id)
+            .ok_or_else(|| "未找到要检测的账号".to_string())?;
+        let relay_input = if matches!(account.source_kind, AccountSourceKind::Relay) {
+            Some(TestApiAccountConnectionInput {
+                label: account.label.clone(),
+                base_url: account.api_base_url.clone().unwrap_or_default(),
+                api_key: account.api_key.clone().unwrap_or_default(),
+                model_name: account.model_name.clone().unwrap_or_default(),
+            })
+        } else {
+            None
+        };
+        (
+            account.account_key(),
+            account.source_kind.clone(),
+            relay_input,
+        )
+    };
+
+    if matches!(source_kind, AccountSourceKind::Relay) {
+        let tested_at = now_unix_seconds();
+        let validation = test_api_account_connection_internal(
+            relay_input.ok_or_else(|| "API 账号配置不完整".to_string())?,
+        )
+        .await;
+        let (ok, balance_text, message) = match validation {
+            Ok(result) => (result.ok, result.balance_text, result.message),
+            Err(error) => (false, None, error),
+        };
+
+        let account = {
+            let _guard = state.store_lock.lock().await;
+            let mut store = load_store(app)?;
+            let current_account_key = current_auth_account_key();
+            let current_variant_key = current_auth_variant_key();
+            let stored = store
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+                .ok_or_else(|| "检测期间账号已被删除".to_string())?;
+            stored.profile_last_validated_at = Some(tested_at);
+            stored.profile_last_validation_error = (!ok).then(|| message.clone());
+            if ok {
+                stored.balance_text = balance_text;
+            }
+            stored.updated_at = tested_at;
+            let summary = stored.to_summary(
+                current_account_key.as_deref(),
+                current_variant_key.as_deref(),
+            );
+            save_store(app, &store)?;
+            summary
+        };
+
+        return Ok(TestAccountStatusResult {
+            account,
+            ok,
+            message,
+        });
+    }
+
+    let summaries = refresh_usage_internal(app, state, true, Some(&account_key)).await?;
+    let account = match summaries
+        .into_iter()
+        .find(|account| account.id == id || account.account_key == account_key)
+    {
+        Some(account) => account,
+        None => list_accounts_internal(app, state)
+            .await?
+            .into_iter()
+            .find(|account| account.account_key == account_key)
+            .ok_or_else(|| "检测期间账号已被删除".to_string())?,
+    };
+    let now = now_unix_seconds();
+    let free_plan = plan_type_is_free(
+        account
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.plan_type.as_deref())
+            .or(account.plan_type.as_deref()),
+    );
+    let authorization_failure = account.auth_refresh_blocked
+        || usage_error_indicates_authorization_failure(account.usage_error.as_deref());
+    let exhausted = usage_has_active_exhausted_window(account.usage.as_ref(), now);
+    let (ok, message) = if authorization_failure {
+        (
+            false,
+            account
+                .auth_refresh_error
+                .clone()
+                .or(account.usage_error.clone())
+                .unwrap_or_else(|| "账号登录或授权已失效".to_string()),
+        )
+    } else if free_plan {
+        (
+            false,
+            "账号当前为 Free 套餐，无法用于 Codex 自动切换或反代".to_string(),
+        )
+    } else if exhausted {
+        (
+            false,
+            "账号额度已耗尽，将在额度窗口重置后自动恢复".to_string(),
+        )
+    } else if let Some(error) = account.usage_error.clone() {
+        (false, error)
+    } else {
+        (true, "账号状态正常".to_string())
+    };
+
+    Ok(TestAccountStatusResult {
+        account,
+        ok,
+        message,
+    })
 }
 
 async fn refresh_usage_targets_with_workers(
