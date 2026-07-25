@@ -1,6 +1,6 @@
 {
   "name": "@ssrsec/ctc-darwin-x64",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "description": "Codex Tools native CLI for macOS Intel",
   "license": "MIT",
   "homepage": "https://github.com/ssrsec/codex-tools",
