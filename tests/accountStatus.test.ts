@@ -101,6 +101,16 @@ test("cleanup only targets definite, non-current failures", () => {
   assert.equal(accountCanBeCleaned(account("free", { usage: usage("free") })), true);
   assert.equal(
     accountCanBeCleaned(
+      account("removed-team-member", {
+        planType: "k12",
+        usage: usage("k12"),
+        usageError: "该账号已被踢出 team 组织，请重新授权后再刷新。",
+      }),
+    ),
+    true,
+  );
+  assert.equal(
+    accountCanBeCleaned(
       account("current-free", {
         usage: usage("free"),
         isCurrent: true,

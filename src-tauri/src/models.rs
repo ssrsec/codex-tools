@@ -262,6 +262,17 @@ pub(crate) fn usage_error_indicates_authorization_failure(error: Option<&str>) -
         || normalized.contains("登录授权")
         || normalized.contains("账号被封禁")
         || normalized.contains("deactivated")
+        || normalized.contains("被踢出 team 组织")
+        || normalized.contains("被移出 team 组织")
+        || normalized.contains("被移出工作区")
+        || normalized.contains("不再是 team 组织成员")
+        || normalized.contains("not a member of this workspace")
+        || normalized.contains("not a member of the workspace")
+        || normalized.contains("no longer a member of the workspace")
+        || ((normalized.contains("removed from") || normalized.contains("lost access to"))
+            && (normalized.contains("workspace")
+                || normalized.contains("team")
+                || normalized.contains("organization")))
 }
 
 pub(crate) fn account_is_eligible_for_automatic_use(account: &StoredAccount, now: i64) -> bool {
@@ -997,6 +1008,7 @@ mod tests {
     use super::account_is_eligible_for_automatic_use;
     use super::dedupe_account_variants;
     use super::mark_current_account_summary;
+    use super::usage_error_indicates_authorization_failure;
     use super::AppSettings;
     use super::AppSettingsPatch;
     use super::StoredAccount;
@@ -1130,6 +1142,27 @@ mod tests {
         assert!(!account_is_eligible_for_automatic_use(&free, 15));
         assert!(!account_is_eligible_for_automatic_use(&blocked, 15));
         assert!(!account_is_eligible_for_automatic_use(&forbidden, 15));
+    }
+
+    #[test]
+    fn removed_team_membership_is_a_permanent_authorization_failure() {
+        let messages = [
+            "该账号已被踢出 team 组织，请重新授权后再刷新。",
+            "账号已被移出工作区",
+            "This account is not a member of this workspace",
+            "User was removed from the organization",
+        ];
+
+        for message in messages {
+            assert!(
+                usage_error_indicates_authorization_failure(Some(message)),
+                "membership failure should be rejected: {message}"
+            );
+        }
+
+        assert!(!usage_error_indicates_authorization_failure(Some(
+            "503 Service Unavailable"
+        )));
     }
 
     #[test]

@@ -64,6 +64,11 @@ test("smart switch excludes blocked, authorization-failed, Free, and exhausted a
     account("authorization", {
       usageError: "403 Forbidden",
     }),
+    account("removed-team-member", {
+      planType: "k12",
+      usage: usage("k12"),
+      usageError: "该账号已被踢出 team 组织，请重新授权后再刷新。",
+    }),
     account("free", {
       planType: "pro",
       usage: usage("free"),

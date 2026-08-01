@@ -41,6 +41,17 @@ export function classifyUsageRefreshError(error: string): UsageRefreshFailureKin
     normalized.includes("重新登录") ||
     normalized.includes("账号被封禁") ||
     normalized.includes("deactivated") ||
+    normalized.includes("被踢出 team 组织") ||
+    normalized.includes("被移出 team 组织") ||
+    normalized.includes("被移出工作区") ||
+    normalized.includes("不再是 team 组织成员") ||
+    normalized.includes("not a member of this workspace") ||
+    normalized.includes("not a member of the workspace") ||
+    normalized.includes("no longer a member of the workspace") ||
+    ((normalized.includes("removed from") || normalized.includes("lost access to")) &&
+      (normalized.includes("workspace") ||
+        normalized.includes("team") ||
+        normalized.includes("organization"))) ||
     normalized.includes("account blocked")
   ) {
     return "authorization";

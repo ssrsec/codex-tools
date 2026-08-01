@@ -59,6 +59,12 @@ const fixtures: Array<{
     expectedLabel: "更新失败：授权异常 · 显示缓存 07/22 09:54",
   },
   {
+    name: "已被移出 Team 组织",
+    error: "该账号已被踢出 team 组织，请重新授权后再刷新。",
+    expectedKind: "authorization",
+    expectedLabel: "更新失败：授权异常 · 显示缓存 07/22 09:54",
+  },
+  {
     name: "请求限制",
     error:
       "请求用量接口失败: https://chatgpt.com/backend-api/wham/usage -> 429 Too Many Requests: usage_limit_reached",
