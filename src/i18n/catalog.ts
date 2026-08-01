@@ -280,6 +280,8 @@ export type MessageCatalog = {
     loadBalanceLabel: string;
     loadBalanceAverage: string;
     loadBalanceSequential: string;
+    defaultServiceTierLabel: string;
+    defaultServiceTierDescription: string;
     sequentialFiveHourLimitLabel: string;
     sequentialFiveHourLimitDescription: string;
     modelMenuLabel: string;

@@ -77,6 +77,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   autoStartApiProxy: false,
   apiProxyPort: 8787,
   apiProxyLoadBalanceMode: "average",
+  apiProxyDefaultServiceTier: "default",
   apiProxySequentialFiveHourLimitPercent: 80,
   apiProxyDisabledModels: [],
   remoteServers: [],

@@ -23,6 +23,7 @@ import type {
   CloudflaredStatus,
   CloudflaredTunnelMode,
   ApiProxyLoadBalanceMode,
+  ApiProxyServiceTier,
   RemoteAuthMode,
   RemoteProxyStatus,
   RemoteServerConfig,
@@ -77,6 +78,7 @@ type ApiProxyPanelProps = {
   autoStartEnabled: boolean;
   savedPort: number;
   loadBalanceMode: ApiProxyLoadBalanceMode;
+  defaultServiceTier: ApiProxyServiceTier;
   sequentialFiveHourLimitPercent: number;
   apiProxySupportedModels: string[];
   apiProxyDisabledModels: string[];
@@ -116,6 +118,7 @@ type ApiProxyPanelProps = {
   onToggleAutoStart: (enabled: boolean) => void;
   onPersistPort: (port: number) => Promise<void> | void;
   onUpdateLoadBalanceMode: (mode: ApiProxyLoadBalanceMode) => Promise<void> | void;
+  onUpdateDefaultServiceTier: (tier: ApiProxyServiceTier) => Promise<void> | void;
   onUpdateSequentialFiveHourLimitPercent: (percent: number) => Promise<void> | void;
   onUpdateApiProxyDisabledModels: (models: string[]) => Promise<void> | void;
   onUpdateRemoteServers: (servers: RemoteServerConfig[]) => void;
@@ -1688,6 +1691,7 @@ export function ApiProxyPanel({
   autoStartEnabled,
   savedPort,
   loadBalanceMode,
+  defaultServiceTier,
   sequentialFiveHourLimitPercent,
   apiProxySupportedModels,
   apiProxyDisabledModels,
@@ -1727,6 +1731,7 @@ export function ApiProxyPanel({
   onToggleAutoStart,
   onPersistPort,
   onUpdateLoadBalanceMode,
+  onUpdateDefaultServiceTier,
   onUpdateSequentialFiveHourLimitPercent,
   onUpdateApiProxyDisabledModels,
   onUpdateRemoteServers,
@@ -1835,6 +1840,20 @@ export function ApiProxyPanel({
       { id: "sequential" as const, label: proxyCopy.loadBalanceSequential },
     ],
     [proxyCopy.loadBalanceAverage, proxyCopy.loadBalanceSequential],
+  );
+  const defaultServiceTierOptions = useMemo(
+    () => [
+      { id: "auto" as const, label: proxyCopy.serviceTierAuto },
+      { id: "default" as const, label: proxyCopy.serviceTierDefault },
+      { id: "fast" as const, label: proxyCopy.serviceTierFast },
+      { id: "flex" as const, label: proxyCopy.serviceTierFlex },
+    ],
+    [
+      proxyCopy.serviceTierAuto,
+      proxyCopy.serviceTierDefault,
+      proxyCopy.serviceTierFast,
+      proxyCopy.serviceTierFlex,
+    ],
   );
   const portInput = portDraft ?? String(status.port ?? savedPort ?? DEFAULT_PROXY_PORT);
   const codexBindTitle = status.codexProxyBound
@@ -2486,6 +2505,22 @@ export function ApiProxyPanel({
                 }}
               />
             </div>
+
+            <div className="proxyBalanceHeader">
+              <span className="proxyLabel">{proxyCopy.defaultServiceTierLabel}</span>
+              <EditorMultiSelect
+                className="proxyModePicker"
+                options={defaultServiceTierOptions}
+                value={defaultServiceTier}
+                ariaLabel={proxyCopy.defaultServiceTierLabel}
+                placeholder={proxyCopy.defaultServiceTierLabel}
+                disabled={savingSettings}
+                onChange={(tier) => {
+                  void onUpdateDefaultServiceTier(tier);
+                }}
+              />
+            </div>
+            <p>{proxyCopy.defaultServiceTierDescription}</p>
 
             {loadBalanceMode === "sequential" ? (
               <div className="proxySequentialLimit">

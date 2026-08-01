@@ -119,7 +119,7 @@ pub(crate) fn sync_account_profile_in_store_path(
     let config_template =
         read_optional_text(&config_path)?.or(read_current_codex_config_optional()?);
     let config_text = match account.source_kind {
-        AccountSourceKind::Chatgpt => build_chatgpt_profile_config(config_template.as_deref()),
+        AccountSourceKind::Chatgpt => build_chatgpt_profile_config(config_template.as_deref())?,
         AccountSourceKind::Relay => build_relay_profile_config(
             config_template.as_deref(),
             account
@@ -130,7 +130,7 @@ pub(crate) fn sync_account_profile_in_store_path(
                 .model_name
                 .as_deref()
                 .ok_or_else(|| RELAY_INCOMPLETE_MESSAGE.to_string())?,
-        ),
+        )?,
     };
 
     let auth_json = match account.source_kind {
@@ -187,20 +187,38 @@ pub(crate) fn apply_account_profile(account: &StoredAccount) -> Result<(), Strin
             auth_path.display()
         )
     })?;
-    auth::write_active_codex_auth(&auth_json)?;
 
-    let config_contents = fs::read_to_string(&config_path).map_err(|error| {
+    let profile_config_contents = fs::read_to_string(&config_path).map_err(|error| {
         format!(
             "读取账号 profile config.toml 失败 {}: {error}",
             config_path.display()
         )
     })?;
     let active_config_path = current_codex_config_path()?;
+    let active_config = read_optional_text(&active_config_path)?;
+    let config_template = active_config
+        .as_deref()
+        .or(Some(profile_config_contents.as_str()));
+    let config_contents = match account.source_kind {
+        AccountSourceKind::Chatgpt => build_chatgpt_profile_config(config_template)?,
+        AccountSourceKind::Relay => build_relay_profile_config(
+            config_template,
+            account
+                .api_base_url
+                .as_deref()
+                .ok_or_else(|| RELAY_INCOMPLETE_MESSAGE.to_string())?,
+            account
+                .model_name
+                .as_deref()
+                .ok_or_else(|| RELAY_INCOMPLETE_MESSAGE.to_string())?,
+        )?,
+    };
     let parent = active_config_path
         .parent()
         .ok_or_else(|| format!("无法解析 Codex 配置目录 {}", active_config_path.display()))?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("创建 Codex 配置目录失败 {}: {error}", parent.display()))?;
+    auth::write_active_codex_auth(&auth_json)?;
     write_file_atomically(&active_config_path, config_contents.as_bytes())?;
     Ok(())
 }
@@ -237,13 +255,12 @@ pub(crate) fn bind_codex_to_api_proxy(
 
     let config_path = current_codex_config_path()?;
     let auth_path = app_paths::codex_auth_path()?;
-    ensure_codex_proxy_backup(&config_path, &auth_path, &base_url)?;
-
     let config_template = read_optional_text(&config_path)?;
-    let config_text = build_codex_proxy_config(config_template.as_deref(), &base_url);
+    let config_text = build_codex_proxy_config(config_template.as_deref(), &base_url)?;
     let auth_json = build_api_auth_json(api_key);
     let serialized_auth = serde_json::to_string_pretty(&auth_json)
         .map_err(|error| format!("序列化本机反代 auth.json 失败: {error}"))?;
+    ensure_codex_proxy_backup(&config_path, &auth_path, &base_url)?;
 
     write_file_atomically(&config_path, config_text.as_bytes())?;
     write_file_atomically(&auth_path, serialized_auth.as_bytes())?;
@@ -267,10 +284,10 @@ pub(crate) fn restore_codex_proxy_binding() -> Result<CodexProxyBindingState, St
 
     let config_path = current_codex_config_path()?;
     let auth_path = app_paths::codex_auth_path()?;
-    restore_backup_file(
+    restore_codex_proxy_config_preserving_user_settings(
         &codex_proxy_config_backup_path()?,
         &config_path,
-        metadata.config_existed,
+        &metadata,
     )?;
     restore_backup_file(
         &codex_proxy_auth_backup_path()?,
@@ -441,8 +458,8 @@ fn compute_profile_integrity_error(
     }
 }
 
-fn build_chatgpt_profile_config(current_config: Option<&str>) -> String {
-    let mut document = parse_config_or_default(current_config);
+fn build_chatgpt_profile_config(current_config: Option<&str>) -> Result<String, String> {
+    let mut document = parse_config_or_default(current_config)?;
     let had_base_url = document.get("openai_base_url").is_some();
     document.remove("openai_base_url");
     if had_base_url {
@@ -451,25 +468,28 @@ fn build_chatgpt_profile_config(current_config: Option<&str>) -> String {
     // Codex filters local history by model_provider; account switching should
     // keep official login history on the built-in provider key.
     document["model_provider"] = value("openai");
-    document.to_string()
+    Ok(document.to_string())
 }
 
 fn build_relay_profile_config(
     current_config: Option<&str>,
     base_url: &str,
     model_name: &str,
-) -> String {
-    let mut document = parse_config_or_default(current_config);
+) -> Result<String, String> {
+    let mut document = parse_config_or_default(current_config)?;
     document["openai_base_url"] = value(base_url);
     document["model"] = value(model_name);
     // Relay/API accounts still use the built-in OpenAI-compatible provider so
     // existing Codex history remains visible after switching account types.
     document["model_provider"] = value("openai");
-    document.to_string()
+    Ok(document.to_string())
 }
 
-fn build_codex_proxy_config(current_config: Option<&str>, base_url: &str) -> String {
-    let mut document = parse_config_or_default(current_config);
+fn build_codex_proxy_config(
+    current_config: Option<&str>,
+    base_url: &str,
+) -> Result<String, String> {
+    let mut document = parse_config_or_default(current_config)?;
     document["openai_base_url"] = value(base_url);
     document["model_provider"] = value("openai");
     set_missing_string_default(&mut document, "model", DEFAULT_API_PROXY_MODEL);
@@ -483,7 +503,7 @@ fn build_codex_proxy_config(current_config: Option<&str>, base_url: &str) -> Str
         "service_tier",
         DEFAULT_API_PROXY_SERVICE_TIER,
     );
-    document.to_string()
+    Ok(document.to_string())
 }
 
 fn set_missing_string_default(document: &mut DocumentMut, key: &str, default_value: &str) {
@@ -496,10 +516,13 @@ fn set_missing_string_default(document: &mut DocumentMut, key: &str, default_val
     }
 }
 
-fn parse_config_or_default(current_config: Option<&str>) -> DocumentMut {
-    current_config
-        .and_then(|raw| raw.parse::<DocumentMut>().ok())
-        .unwrap_or_default()
+fn parse_config_or_default(current_config: Option<&str>) -> Result<DocumentMut, String> {
+    match current_config {
+        Some(raw) => raw
+            .parse::<DocumentMut>()
+            .map_err(|error| format!("Codex config.toml 无法解析，已保留原文件: {error}")),
+        None => Ok(DocumentMut::new()),
+    }
 }
 
 fn read_current_codex_config_optional() -> Result<Option<String>, String> {
@@ -626,6 +649,111 @@ fn restore_backup_file(
     }
 }
 
+fn restore_codex_proxy_config_preserving_user_settings(
+    backup_path: &Path,
+    target_path: &Path,
+    metadata: &CodexProxyBindingBackupMetadata,
+) -> Result<(), String> {
+    if metadata.config_existed && !target_path.is_file() {
+        return restore_backup_file(backup_path, target_path, true);
+    }
+    let current = read_optional_text(target_path)?.unwrap_or_default();
+    let mut current_document = match current.parse::<DocumentMut>() {
+        Ok(document) => document,
+        Err(error) => {
+            return Err(format!(
+                "当前 Codex config.toml 无法解析，已保留当前文件和反代备份: {error}"
+            ));
+        }
+    };
+    let still_bound = codex_config_openai_base_url(&current).as_deref()
+        == normalize_codex_proxy_base_url(&metadata.bound_base_url).as_deref();
+
+    let backup_document = if metadata.config_existed {
+        let backup = fs::read_to_string(backup_path).map_err(|error| {
+            format!("读取 Codex 备份文件失败 {}: {error}", backup_path.display())
+        })?;
+        Some(
+            backup
+                .parse::<DocumentMut>()
+                .map_err(|error| format!("Codex config.toml 备份无效: {error}"))?,
+        )
+    } else {
+        None
+    };
+
+    if still_bound {
+        restore_config_item_from_backup(
+            &mut current_document,
+            backup_document.as_ref(),
+            "openai_base_url",
+        );
+        restore_config_item_from_backup(
+            &mut current_document,
+            backup_document.as_ref(),
+            "model_provider",
+        );
+        remove_injected_default_if_absent_from_backup(
+            &mut current_document,
+            backup_document.as_ref(),
+            "model",
+            DEFAULT_API_PROXY_MODEL,
+        );
+        remove_injected_default_if_absent_from_backup(
+            &mut current_document,
+            backup_document.as_ref(),
+            "model_reasoning_effort",
+            DEFAULT_API_PROXY_REASONING_EFFORT,
+        );
+        remove_injected_default_if_absent_from_backup(
+            &mut current_document,
+            backup_document.as_ref(),
+            "service_tier",
+            DEFAULT_API_PROXY_SERVICE_TIER,
+        );
+    }
+
+    let restored = current_document.to_string();
+    if !metadata.config_existed && restored.trim().is_empty() {
+        return match fs::remove_file(target_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "移除 Codex 临时绑定文件失败 {}: {error}",
+                target_path.display()
+            )),
+        };
+    }
+
+    write_file_atomically(target_path, restored.as_bytes())
+}
+
+fn restore_config_item_from_backup(
+    current: &mut DocumentMut,
+    backup: Option<&DocumentMut>,
+    key: &str,
+) {
+    if let Some(item) = backup.and_then(|document| document.get(key)) {
+        current[key] = item.clone();
+    } else {
+        current.remove(key);
+    }
+}
+
+fn remove_injected_default_if_absent_from_backup(
+    current: &mut DocumentMut,
+    backup: Option<&DocumentMut>,
+    key: &str,
+    injected_default: &str,
+) {
+    if backup.is_some_and(|document| document.get(key).is_some()) {
+        return;
+    }
+    if current.get(key).and_then(|item| item.as_str()) == Some(injected_default) {
+        current.remove(key);
+    }
+}
+
 fn cleanup_codex_proxy_backup() {
     if let Ok(path) = codex_proxy_backup_metadata_path() {
         let _ = fs::remove_file(path);
@@ -735,9 +863,13 @@ fn write_file_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::build_chatgpt_profile_config;
     use super::build_codex_proxy_config;
+    use super::build_relay_profile_config;
     use super::ensure_codex_proxy_backup_in_dir;
     use super::normalize_codex_proxy_base_url;
+    use super::restore_codex_proxy_config_preserving_user_settings;
+    use super::CodexProxyBindingBackupMetadata;
     use super::CODEX_PROXY_BACKUP_METADATA_FILE_NAME;
     use super::PROFILE_AUTH_FILE_NAME;
     use super::PROFILE_CONFIG_FILE_NAME;
@@ -765,7 +897,8 @@ openai_base_url = "https://api.openai.com/v1"
 "#,
             ),
             "http://127.0.0.1:8787/v1",
-        );
+        )
+        .expect("proxy config should build");
         let document = config
             .parse::<DocumentMut>()
             .expect("proxy config should parse");
@@ -777,19 +910,119 @@ openai_base_url = "https://api.openai.com/v1"
         assert_eq!(document["model_provider"].as_str(), Some("openai"));
         assert_eq!(document["model"].as_str(), Some("gpt-5.4"));
         assert_eq!(document["model_reasoning_effort"].as_str(), Some("xhigh"));
-        assert_eq!(document["service_tier"].as_str(), Some("fast"));
+        assert_eq!(document["service_tier"].as_str(), Some("default"));
     }
 
     #[test]
     fn build_codex_proxy_config_uses_gpt_5_6_defaults_for_new_profiles() {
-        let config = build_codex_proxy_config(None, "http://127.0.0.1:8787/v1");
+        let config = build_codex_proxy_config(None, "http://127.0.0.1:8787/v1")
+            .expect("proxy config should build");
         let document = config
             .parse::<DocumentMut>()
             .expect("proxy config should parse");
 
         assert_eq!(document["model"].as_str(), Some("gpt-5.6-sol"));
         assert_eq!(document["model_reasoning_effort"].as_str(), Some("xhigh"));
-        assert_eq!(document["service_tier"].as_str(), Some("fast"));
+        assert_eq!(document["service_tier"].as_str(), Some("default"));
+    }
+
+    #[test]
+    fn proxy_and_account_configs_preserve_unmanaged_user_settings() {
+        let original = r#"
+model = "gpt-user-choice"
+model_reasoning_effort = "high"
+service_tier = "auto"
+
+[features]
+experimental = true
+
+[mcp_servers.context7]
+command = "npx"
+args = ["-y", "@upstash/context7-mcp"]
+
+[hooks.after_turn]
+command = "notify-send"
+
+[pet]
+name = "Mochi"
+"#;
+
+        for config in [
+            build_codex_proxy_config(Some(original), "http://127.0.0.1:8787/v1")
+                .expect("proxy config should build"),
+            build_chatgpt_profile_config(Some(original)).expect("ChatGPT config should build"),
+            build_relay_profile_config(Some(original), "https://relay.example/v1", "relay-model")
+                .expect("relay config should build"),
+        ] {
+            let document = config.parse::<DocumentMut>().expect("config should parse");
+            assert_eq!(document["features"]["experimental"].as_bool(), Some(true));
+            assert_eq!(
+                document["mcp_servers"]["context7"]["command"].as_str(),
+                Some("npx")
+            );
+            assert_eq!(
+                document["hooks"]["after_turn"]["command"].as_str(),
+                Some("notify-send")
+            );
+            assert_eq!(document["pet"]["name"].as_str(), Some("Mochi"));
+            assert_eq!(document["model_reasoning_effort"].as_str(), Some("high"));
+            assert_eq!(document["service_tier"].as_str(), Some("auto"));
+        }
+    }
+
+    #[test]
+    fn invalid_user_config_is_rejected_instead_of_replaced() {
+        let invalid = "[mcp_servers.invalid\ncommand = \"broken\"";
+        let error = build_codex_proxy_config(Some(invalid), "http://127.0.0.1:8787/v1")
+            .expect_err("invalid user config must not be overwritten");
+        assert!(error.contains("已保留原文件"));
+    }
+
+    #[test]
+    fn restoring_proxy_binding_keeps_settings_changed_while_bound() {
+        let sandbox = unique_test_dir("restore-merge");
+        fs::create_dir_all(&sandbox).expect("create sandbox");
+        let backup_path = sandbox.join("backup.toml");
+        let target_path = sandbox.join("config.toml");
+        fs::write(
+            &backup_path,
+            "model = \"gpt-user-choice\"\nmodel_provider = \"original\"\n[features]\nold = true\n",
+        )
+        .expect("write backup");
+        fs::write(
+            &target_path,
+            "model = \"gpt-user-choice\"\nmodel_provider = \"openai\"\nopenai_base_url = \"http://127.0.0.1:8787/v1\"\n[features]\nold = true\nnew = true\n[mcp_servers.local]\ncommand = \"custom-mcp\"\n[hooks.after_turn]\ncommand = \"custom-hook\"\n[pet]\nname = \"Mochi\"\n",
+        )
+        .expect("write current config");
+        let metadata = CodexProxyBindingBackupMetadata {
+            config_existed: true,
+            auth_existed: true,
+            bound_base_url: "http://127.0.0.1:8787/v1".to_string(),
+            bound_at: 1,
+        };
+
+        restore_codex_proxy_config_preserving_user_settings(&backup_path, &target_path, &metadata)
+            .expect("restore config");
+
+        let restored = fs::read_to_string(&target_path)
+            .expect("read restored config")
+            .parse::<DocumentMut>()
+            .expect("restored config should parse");
+        assert!(restored.get("openai_base_url").is_none());
+        assert_eq!(restored["model_provider"].as_str(), Some("original"));
+        assert_eq!(restored["features"]["old"].as_bool(), Some(true));
+        assert_eq!(restored["features"]["new"].as_bool(), Some(true));
+        assert_eq!(
+            restored["mcp_servers"]["local"]["command"].as_str(),
+            Some("custom-mcp")
+        );
+        assert_eq!(
+            restored["hooks"]["after_turn"]["command"].as_str(),
+            Some("custom-hook")
+        );
+        assert_eq!(restored["pet"]["name"].as_str(), Some("Mochi"));
+
+        let _ = fs::remove_dir_all(&sandbox);
     }
 
     #[test]

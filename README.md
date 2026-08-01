@@ -146,7 +146,7 @@ Codex Tools 可以启动本地 OpenAI 兼容反代：
 - 上游来源：已导入的 Codex 账号
 - 账号选择：自动排除授权失效、Free、额度耗尽及冷却中的账号，按当前一周额度选择并支持运行中切换
 - 默认模型：`gpt-5.6-sol`
-- 默认推理：`xhigh` + `fast`
+- 默认推理：`xhigh` + `default`（标准速度）
 - GPT-5.6 模型：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`
 
 更多链路说明见 [docs/api-proxy.md](docs/api-proxy.md)。
@@ -172,7 +172,7 @@ Cursor 可能由服务端代发请求，不建议填写 `127.0.0.1`、`localhost
 
 模型名称建议使用 `gpt-5.6-sol`。`gpt-5.6`、`gpt5.6` 和 `gpt-5-6` 会映射到 Sol，Terra/Luna 也兼容无点号和全连字符别名。
 
-GPT-5.6 可用推理强度为 `none`、`low`、`medium`、`high`、`xhigh`、`max`；代理还保留 `minimal` 供旧模型兼容。可用速度为 `auto`、`default`、`fast`、`flex`，其中 `fast` 会按上游 wire 值 `priority` 发送。
+GPT-5.6 可用推理强度为 `none`、`low`、`medium`、`high`、`xhigh`、`max`；代理还保留 `minimal` 供旧模型兼容。可用速度为 `auto`、`default`、`fast`、`flex`，其中 `fast` 会按上游 wire 值 `priority` 发送。客户端未传 `service_tier` 时，使用反代页面的“默认速度”设置，初始为 `default`；客户端显式传值时始终优先。
 
 ### CC Switch
 

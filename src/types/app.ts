@@ -419,6 +419,7 @@ export type ThemeMode = "light" | "dark";
 export type TrayUsageDisplayMode = "remaining" | "used" | "fiveHourRemaining" | "oneWeekRemaining" | "hidden";
 
 export type ApiProxyLoadBalanceMode = "average" | "sequential";
+export type ApiProxyServiceTier = "auto" | "default" | "fast" | "flex";
 
 export type EditorAppId =
   | "vscode"
@@ -450,6 +451,7 @@ export type AppSettings = {
   autoStartApiProxy: boolean;
   apiProxyPort: number;
   apiProxyLoadBalanceMode: ApiProxyLoadBalanceMode;
+  apiProxyDefaultServiceTier: ApiProxyServiceTier;
   apiProxySequentialFiveHourLimitPercent: number;
   apiProxyDisabledModels: string[];
   remoteServers: RemoteServerConfig[];

@@ -122,7 +122,7 @@ const ANTHROPIC_MESSAGES_REQUIRED_VERSION: &str = "2023-06-01";
 const SSE_DONE: &str = "data: [DONE]\n\n";
 const DEFAULT_IMAGE_CONTROLLER_MODEL: &str = "gpt-5.5";
 const DEFAULT_IMAGE_TOOL_MODEL: &str = "gpt-image-2";
-const DEFAULT_UPSTREAM_SERVICE_TIER: &str = "priority";
+const DEFAULT_UPSTREAM_SERVICE_TIER: &str = "default";
 const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 const IMAGE_VARIATION_PROMPT: &str = "Create a faithful variation of the provided image.";
 const MODELS: &[&str] = &[
@@ -1126,7 +1126,7 @@ async fn chat_completions_handler(
     };
     let session_affinity_key = request_session_affinity_key(&headers, &request_json);
 
-    let (upstream_payload, downstream_stream) =
+    let (mut upstream_payload, downstream_stream) =
         match convert_openai_chat_request_to_codex(&request_json) {
             Ok(value) => value,
             Err(message) => return invalid_request_response(&message),
@@ -1137,7 +1137,7 @@ async fn chat_completions_handler(
         &proxy_key,
         "/v1/chat/completions",
         &headers,
-        &upstream_payload,
+        &mut upstream_payload,
         session_affinity_key.as_deref(),
     )
     .await
@@ -1207,7 +1207,7 @@ async fn responses_handler(
     };
     let session_affinity_key = request_session_affinity_key(&headers, &request_json);
 
-    let (upstream_payload, downstream_stream) =
+    let (mut upstream_payload, downstream_stream) =
         match normalize_openai_responses_request(request_json) {
             Ok(value) => value,
             Err(message) => return invalid_request_response(&message),
@@ -1218,7 +1218,7 @@ async fn responses_handler(
         &proxy_key,
         "/v1/responses",
         &headers,
-        &upstream_payload,
+        &mut upstream_payload,
         session_affinity_key.as_deref(),
     )
     .await
@@ -1284,7 +1284,7 @@ async fn anthropic_messages_handler(
     };
     let session_affinity_key = request_session_affinity_key(&headers, &request_json);
 
-    let (upstream_payload, downstream_stream) =
+    let (mut upstream_payload, downstream_stream) =
         match convert_anthropic_messages_request_to_codex(&request_json) {
             Ok(value) => value,
             Err(message) => return invalid_request_response(&message),
@@ -1295,7 +1295,7 @@ async fn anthropic_messages_handler(
         &proxy_key,
         "/v1/messages",
         &headers,
-        &upstream_payload,
+        &mut upstream_payload,
         session_affinity_key.as_deref(),
     )
     .await
@@ -1453,7 +1453,7 @@ async fn forward_image_request(
     session_affinity_key: Option<&str>,
 ) -> Response<Body> {
     let ConvertedImageRequest {
-        upstream_payload,
+        mut upstream_payload,
         downstream_stream,
         image_count,
     } = image_request;
@@ -1463,7 +1463,7 @@ async fn forward_image_request(
         &proxy_key,
         route,
         &headers,
-        &upstream_payload,
+        &mut upstream_payload,
         session_affinity_key,
     )
     .await
@@ -1496,7 +1496,7 @@ async fn forward_image_request(
                     &proxy_key,
                     route,
                     &headers,
-                    &upstream_payload,
+                    &mut upstream_payload,
                     session_affinity_key,
                 )
                 .await
@@ -1616,7 +1616,7 @@ async fn handle_responses_websocket(
     headers: HeaderMap,
 ) {
     let session_affinity_key = request_session_affinity_key_from_headers(&headers);
-    let upstream_payload = match receive_responses_websocket_create(&mut socket).await {
+    let mut upstream_payload = match receive_responses_websocket_create(&mut socket).await {
         Ok(value) => value,
         Err(message) => {
             let _ = send_responses_websocket_error(&mut socket, &message).await;
@@ -1632,7 +1632,7 @@ async fn handle_responses_websocket(
         &proxy_key,
         "/v1/responses websocket",
         &headers,
-        &upstream_payload,
+        &mut upstream_payload,
         session_affinity_key.as_deref(),
     )
     .await
@@ -2151,10 +2151,9 @@ fn convert_openai_chat_request_to_codex(request: &Value) -> Result<(Value, bool)
     if let Some(text) = request_object.get("text") {
         map_text_settings(&mut root, text);
     }
-    root.insert(
-        "service_tier".to_string(),
-        Value::String(api_proxy_service_tier_for_upstream(request_object)?),
-    );
+    if let Some(service_tier) = api_proxy_service_tier_for_upstream(request_object)? {
+        root.insert("service_tier".to_string(), Value::String(service_tier));
+    }
 
     normalize_responses_lite_payload(&mut root)?;
 
@@ -2175,10 +2174,9 @@ fn normalize_openai_responses_request(mut request: Value) -> Result<(Value, bool
     object.insert("model".to_string(), Value::String(model));
     object.insert("stream".to_string(), Value::Bool(true));
     object.insert("store".to_string(), Value::Bool(false));
-    object.insert(
-        "service_tier".to_string(),
-        Value::String(api_proxy_service_tier_for_upstream(object)?),
-    );
+    if let Some(service_tier) = api_proxy_service_tier_for_upstream(object)? {
+        object.insert("service_tier".to_string(), Value::String(service_tier));
+    }
     if !object.contains_key("instructions") {
         object.insert("instructions".to_string(), Value::String(String::new()));
     }
@@ -2306,10 +2304,9 @@ fn convert_anthropic_messages_request_to_codex(request: &Value) -> Result<(Value
     }
     copy_anthropic_passthrough_field(request_object, &mut root, "temperature", "temperature");
     copy_anthropic_passthrough_field(request_object, &mut root, "top_p", "top_p");
-    root.insert(
-        "service_tier".to_string(),
-        Value::String(api_proxy_service_tier_for_upstream(request_object)?),
-    );
+    if let Some(service_tier) = api_proxy_service_tier_for_upstream(request_object)? {
+        root.insert("service_tier".to_string(), Value::String(service_tier));
+    }
     if let Some(stop_sequences) = request_object.get("stop_sequences") {
         root.insert("stop".to_string(), stop_sequences.clone());
     }
@@ -4071,7 +4068,7 @@ async fn send_codex_request_over_candidates(
     proxy_key: &ApiProxyKey,
     route: &str,
     headers: &HeaderMap,
-    payload: &Value,
+    payload: &mut Value,
     session_affinity_key: Option<&str>,
 ) -> Result<(ProxyCandidate, CodexUpstreamResponse), Response<Body>> {
     let selection = match load_proxy_candidate_selection(&context.storage).await {
@@ -4081,6 +4078,7 @@ async fn send_codex_request_over_candidates(
             return Err(json_error_response(StatusCode::BAD_GATEWAY, &error));
         }
     };
+    apply_api_proxy_default_service_tier(payload, &selection.settings);
     if let Err(message) = ensure_api_proxy_payload_models_enabled(payload, &selection.settings) {
         update_proxy_error(context, Some(message.clone())).await;
         return Err(json_error_response(StatusCode::BAD_REQUEST, &message));
@@ -4711,17 +4709,38 @@ fn normalize_api_proxy_service_tier_for_upstream(value: &str) -> Option<String> 
 
 fn api_proxy_service_tier_for_upstream(
     request_object: &Map<String, Value>,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     match request_object.get("service_tier") {
-        None => Ok(DEFAULT_UPSTREAM_SERVICE_TIER.to_string()),
+        None => Ok(None),
         Some(value) => {
             let value = value
                 .as_str()
                 .ok_or_else(|| "service_tier 必须是字符串".to_string())?;
             normalize_api_proxy_service_tier_for_upstream(value)
+                .map(Some)
                 .ok_or_else(|| format!("不支持的推理速度: {value}"))
         }
     }
+}
+
+pub(crate) fn sanitize_api_proxy_service_tier_for_settings(value: &str) -> String {
+    normalize_api_proxy_service_tier_for_log(value)
+        .unwrap_or_else(|| DEFAULT_API_PROXY_SERVICE_TIER.to_string())
+}
+
+fn apply_api_proxy_default_service_tier(payload: &mut Value, settings: &AppSettings) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("service_tier") {
+        return;
+    }
+
+    let configured =
+        sanitize_api_proxy_service_tier_for_settings(&settings.api_proxy_default_service_tier);
+    let upstream = normalize_api_proxy_service_tier_for_upstream(&configured)
+        .unwrap_or_else(|| DEFAULT_UPSTREAM_SERVICE_TIER.to_string());
+    object.insert("service_tier".to_string(), Value::String(upstream));
 }
 
 fn normalize_api_proxy_reasoning_effort_for_upstream(value: &str) -> Result<String, String> {
@@ -7801,6 +7820,7 @@ mod tests {
     use super::api_proxy_visible_models;
     use super::api_proxy_visible_models_for_key;
     use super::append_api_proxy_usage_event;
+    use super::apply_api_proxy_default_service_tier;
     use super::build_api_proxy_usage_stats;
     use super::convert_anthropic_messages_request_to_codex;
     use super::convert_completed_response_to_anthropic_message;
@@ -8799,7 +8819,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_openai_requests_to_gpt_5_6_sol_xhigh_fast_responses_lite() {
+    fn defaults_openai_requests_to_gpt_5_6_sol_xhigh_and_defers_speed_to_settings() {
         let request = json!({
             "messages": [{ "role": "user", "content": "hello" }],
             "tools": [{
@@ -8825,10 +8845,7 @@ mod tests {
                 .and_then(Value::as_str),
             Some("xhigh")
         );
-        assert_eq!(
-            payload.get("service_tier").and_then(Value::as_str),
-            Some("priority")
-        );
+        assert_eq!(payload.get("service_tier").and_then(Value::as_str), None);
         assert_eq!(
             payload.get("parallel_tool_calls").and_then(Value::as_bool),
             Some(false)
@@ -8875,7 +8892,36 @@ mod tests {
             responses_payload
                 .get("service_tier")
                 .and_then(Value::as_str),
-            Some("priority")
+            None
+        );
+    }
+
+    #[test]
+    fn missing_service_tier_uses_proxy_setting_without_overriding_explicit_requests() {
+        for (configured, expected) in [
+            ("auto", "auto"),
+            ("default", "default"),
+            ("fast", "priority"),
+            ("flex", "flex"),
+        ] {
+            let mut settings = AppSettings::default();
+            settings.api_proxy_default_service_tier = configured.to_string();
+            let mut payload = json!({ "model": "gpt-5.6-sol", "input": "hello" });
+            apply_api_proxy_default_service_tier(&mut payload, &settings);
+            assert_eq!(
+                payload.get("service_tier").and_then(Value::as_str),
+                Some(expected),
+                "configured tier {configured}"
+            );
+        }
+
+        let mut settings = AppSettings::default();
+        settings.api_proxy_default_service_tier = "fast".to_string();
+        let mut explicit = json!({ "service_tier": "flex" });
+        apply_api_proxy_default_service_tier(&mut explicit, &settings);
+        assert_eq!(
+            explicit.get("service_tier").and_then(Value::as_str),
+            Some("flex")
         );
     }
 
@@ -8955,7 +9001,7 @@ mod tests {
     #[test]
     fn forwards_every_service_tier_and_alias() {
         for (requested, payload_tier, policy_tier, upstream_tier) in [
-            ("", "priority", "fast", Some("priority")),
+            ("", "default", "default", None),
             ("auto", "auto", "auto", Some("auto")),
             ("default", "default", "default", None),
             ("standard", "default", "default", None),
@@ -9162,7 +9208,7 @@ mod tests {
             anthropic_payload
                 .get("service_tier")
                 .and_then(Value::as_str),
-            Some("priority")
+            None
         );
         assert_eq!(
             anthropic_payload

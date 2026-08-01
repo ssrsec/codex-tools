@@ -12,7 +12,11 @@ use crate::utils::now_unix_seconds;
 
 pub(crate) const DEFAULT_API_PROXY_MODEL: &str = "gpt-5.6-sol";
 pub(crate) const DEFAULT_API_PROXY_REASONING_EFFORT: &str = "xhigh";
-pub(crate) const DEFAULT_API_PROXY_SERVICE_TIER: &str = "fast";
+pub(crate) const DEFAULT_API_PROXY_SERVICE_TIER: &str = "default";
+
+fn default_api_proxy_service_tier() -> String {
+    DEFAULT_API_PROXY_SERVICE_TIER.to_string()
+}
 
 fn default_api_proxy_port() -> u16 {
     8787
@@ -717,6 +721,8 @@ pub(crate) struct AppSettings {
     pub(crate) api_proxy_port: u16,
     #[serde(default)]
     pub(crate) api_proxy_load_balance_mode: ApiProxyLoadBalanceMode,
+    #[serde(default = "default_api_proxy_service_tier")]
+    pub(crate) api_proxy_default_service_tier: String,
     #[serde(default = "default_api_proxy_sequential_five_hour_limit_percent")]
     pub(crate) api_proxy_sequential_five_hour_limit_percent: f64,
     #[serde(default)]
@@ -747,6 +753,7 @@ impl Default for AppSettings {
             auto_start_api_proxy: false,
             api_proxy_port: default_api_proxy_port(),
             api_proxy_load_balance_mode: ApiProxyLoadBalanceMode::default(),
+            api_proxy_default_service_tier: default_api_proxy_service_tier(),
             api_proxy_sequential_five_hour_limit_percent:
                 default_api_proxy_sequential_five_hour_limit_percent(),
             api_proxy_disabled_models: Vec::new(),
@@ -776,6 +783,7 @@ pub(crate) struct AppSettingsPatch {
     pub(crate) auto_start_api_proxy: Option<bool>,
     pub(crate) api_proxy_port: Option<u16>,
     pub(crate) api_proxy_load_balance_mode: Option<ApiProxyLoadBalanceMode>,
+    pub(crate) api_proxy_default_service_tier: Option<String>,
     pub(crate) api_proxy_sequential_five_hour_limit_percent: Option<f64>,
     pub(crate) api_proxy_disabled_models: Option<Vec<String>>,
     pub(crate) remote_servers: Option<Vec<RemoteServerConfig>>,

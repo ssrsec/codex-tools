@@ -258,6 +258,8 @@
     "loadBalanceLabel": "Load balancing",
     "loadBalanceAverage": "Average",
     "loadBalanceSequential": "Sequential",
+    "defaultServiceTierLabel": "Default speed",
+    "defaultServiceTierDescription": "Used when the client omits service_tier; an explicit client value always takes precedence.",
     "sequentialFiveHourLimitLabel": "Quota switch threshold",
     "sequentialFiveHourLimitDescription": "Switch to the next account when usage in the active quota window reaches this percent.",
     "modelMenuLabel": "Model toggles",

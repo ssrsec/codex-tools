@@ -258,6 +258,8 @@
     "loadBalanceLabel": "Балансировка",
     "loadBalanceAverage": "Средний",
     "loadBalanceSequential": "Последовательно",
+    "defaultServiceTierLabel": "Скорость по умолчанию",
+    "defaultServiceTierDescription": "Используется, если клиент не передал service_tier; явно заданное клиентом значение имеет приоритет.",
     "sequentialFiveHourLimitLabel": "Порог переключения квоты",
     "sequentialFiveHourLimitDescription": "Переключаться на следующий аккаунт, когда использование текущего окна квоты достигает этого процента.",
     "modelMenuLabel": "Переключатели моделей",

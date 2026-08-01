@@ -258,6 +258,8 @@
     "loadBalanceLabel": "負荷分散",
     "loadBalanceAverage": "平均",
     "loadBalanceSequential": "順次",
+    "defaultServiceTierLabel": "デフォルト速度",
+    "defaultServiceTierDescription": "クライアントが service_tier を指定しない場合に使用します。明示的な指定がある場合はそちらを優先します。",
     "sequentialFiveHourLimitLabel": "クォータ切替しきい値",
     "sequentialFiveHourLimitDescription": "現在のクォータ期間の使用率がこの割合に達したら次のアカウントへ切り替えます。",
     "modelMenuLabel": "モデル切替",

@@ -339,6 +339,7 @@ function App() {
               autoStartEnabled={settings.autoStartApiProxy}
               savedPort={settings.apiProxyPort}
               loadBalanceMode={settings.apiProxyLoadBalanceMode}
+              defaultServiceTier={settings.apiProxyDefaultServiceTier}
               sequentialFiveHourLimitPercent={
                 settings.apiProxySequentialFiveHourLimitPercent
               }
@@ -392,6 +393,12 @@ function App() {
               onUpdateLoadBalanceMode={(mode) =>
                 updateSettings(
                   { apiProxyLoadBalanceMode: mode },
+                  { silent: true, keepInteractive: true },
+                )
+              }
+              onUpdateDefaultServiceTier={(tier) =>
+                updateSettings(
+                  { apiProxyDefaultServiceTier: tier },
                   { silent: true, keepInteractive: true },
                 )
               }

@@ -258,6 +258,8 @@
     "loadBalanceLabel": "负载均衡",
     "loadBalanceAverage": "平均",
     "loadBalanceSequential": "逐个",
+    "defaultServiceTierLabel": "默认速度",
+    "defaultServiceTierDescription": "客户端未指定 service_tier 时使用此档位；客户端显式指定时以客户端为准。",
     "sequentialFiveHourLimitLabel": "额度切换阈值",
     "sequentialFiveHourLimitDescription": "当当前额度窗口的使用率达到该百分比时切换到下一个账号。",
     "modelMenuLabel": "模型开关",
