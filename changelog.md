@@ -1,5 +1,16 @@
 ## 更新日志
 
+- v2.5.0
+
+1. 切号可靠性：切换 ChatGPT 账号时强制 Codex 使用文件型凭据（`cli_auth_credentials_store = "file"`），避免新版桌面端继续读取 macOS Keychain 旧凭据；切换前捕获桌面端轮换后的授权快照，并同步补全 CLI `ctc switch`，降低切回账号时需要重新登录的风险。
+2. 修复账号去重会把已恢复的健康账号重新标记为“需要重新登录”的问题；修正短 fork 会话在 Token/成本扫描中的越界报错。
+3. 修复“点当前账号切换/启动”在应用未运行时无反应的问题；macOS 会在应用未运行时重新拉起，同时避免同账号重复生成项目状态备份。
+4. 用量刷新支持明确的部分失败提示：部分账号失败时不再误报“用量已刷新”，并使用短中文原因；全部失败和个别失败分别提示。
+5. API 反代新增 GPT-6 系列模型：`gpt-6-astra`、`gpt-6.1-sol`、`gpt-6.1-terra`、`gpt-6-sol`、`gpt-6-luna`，兼容常见别名与日期快照，使用 Codex 0.159 Responses Lite 契约和按模型族的推理强度校验。
+6. ChatGPT 账号的图片生成改为调用 Codex 原生 `images/generations` / `images/edits` 端点，不再依赖已退役的 `gpt-5.5` 控制模型；支持 PNG、`n>1` 逐张生成和流式单事件完成。
+7. Chat Completions 流式响应补齐终止语义：`completed/done/incomplete/failed/cancelled/error` 与未终止流都会给出明确的 finish/error，并保证只发送一个 `[DONE]`。
+8. 文档补充 file 凭据存储、GPT-6 模型、原生图片端点与流式终止的说明；macOS、Windows、Linux 构建保持兼容。
+
 - v2.4.3
 
 1. 一键清理新增 Team/组织/工作区成员资格被移除的中英文错误识别，包括 K12 账号常见的“已被踢出 team 组织”状态。
