@@ -492,18 +492,20 @@ pub(crate) fn config_matches_account_text(raw: &str, account: &StoredAccount) ->
     let Ok(document) = raw.parse::<DocumentMut>() else {
         return false;
     };
-    if document
-        .get("cli_auth_credentials_store")
-        .and_then(|item| item.as_str())
-        != Some(MANAGED_AUTH_CREDENTIALS_STORE)
-    {
-        return false;
-    }
 
     match account.source_kind {
         // ChatGPT 账号只校验凭据存储方式：base_url / model_provider 由
         // build_chatgpt_profile_config 保证，额外校验会让用户正常改动触发多余重启。
-        AccountSourceKind::Chatgpt => true,
+        //
+        // 注意：credentials 键的校验必须在 ChatGPT 分支内完成。build_relay_profile_config
+        // 不写该键，若放在 match 之前，新建的 Relay profile 会永远判定为“不匹配”，
+        // 点当前 Relay 账号就会触发一次完整切换（停 App / 备份 / 写盘 / 拉起）。
+        AccountSourceKind::Chatgpt => {
+            document
+                .get("cli_auth_credentials_store")
+                .and_then(|item| item.as_str())
+                == Some(MANAGED_AUTH_CREDENTIALS_STORE)
+        }
         AccountSourceKind::Relay => {
             document
                 .get("openai_base_url")
@@ -1256,19 +1258,23 @@ cli_auth_credentials_store = "keyring"
     }
 
     #[test]
-    fn relay_config_match_requires_base_url_model_and_provider() {
+    fn relay_config_match_requires_only_base_url_model_and_provider() {
         let account = test_account(
             AccountSourceKind::Relay,
             Some("http://127.0.0.1:8787/v1"),
             Some("gpt-5.6-sol"),
         );
+        // 新建的 Relay profile 配置没有 cli_auth_credentials_store 键，也必须判定为匹配，
+        // 否则点当前 Relay 账号会误触发完整切换。
         let matching = r#"
-cli_auth_credentials_store = "file"
 openai_base_url = "http://127.0.0.1:8787/v1"
 model = "gpt-5.6-sol"
 model_provider = "openai"
 "#;
         assert!(config_matches_account_text(matching, &account));
+        // Relay 分支不校验 credentials 键：即使残留其它值也不影响判定。
+        let with_credentials = format!("cli_auth_credentials_store = \"keyring\"\n{matching}");
+        assert!(config_matches_account_text(&with_credentials, &account));
 
         let mutated_base_url = matching.replace("8787", "9999");
         assert!(!config_matches_account_text(&mutated_base_url, &account));
@@ -1283,5 +1289,41 @@ openai_base_url = "http://127.0.0.1:8787/v1"
 model_provider = "openai"
 "#;
         assert!(!config_matches_account_text(missing_model, &account));
+    }
+
+    #[test]
+    fn relay_config_match_does_not_require_credentials_store() {
+        let account = test_account(
+            AccountSourceKind::Relay,
+            Some("http://127.0.0.1:8787/v1"),
+            Some("gpt-5.6-sol"),
+        );
+        // build_relay_profile_config 不写 cli_auth_credentials_store，缺键必须仍匹配。
+        let without_credentials = r#"
+openai_base_url = "http://127.0.0.1:8787/v1"
+model = "gpt-5.6-sol"
+model_provider = "openai"
+"#;
+        assert!(config_matches_account_text(without_credentials, &account));
+
+        // 该键存在但值不是 file 时，Relay 判定也不应受影响。
+        let with_keyring =
+            format!("cli_auth_credentials_store = \"keyring\"\n{without_credentials}");
+        assert!(config_matches_account_text(&with_keyring, &account));
+
+        // 三字段任一不等仍然 false（无 credentials 键的配置）。
+        assert!(!config_matches_account_text(
+            &without_credentials.replace("8787", "9999"),
+            &account
+        ));
+        assert!(!config_matches_account_text(
+            &without_credentials.replace("gpt-5.6-sol", "gpt-6-astra"),
+            &account
+        ));
+        assert!(!config_matches_account_text(
+            &without_credentials
+                .replace("model_provider = \"openai\"", "model_provider = \"relay\""),
+            &account
+        ));
     }
 }
