@@ -515,7 +515,7 @@ OpenAI 里的：
 | `response.completed` / `response.done` | `finish_reason` + `[DONE]` |
 | `response.incomplete`（或 completed 且 status=incomplete） | `max_output_tokens` → `length`；`content_filter` → `content_filter`；其它原因 → `error` chunk |
 | `response.failed` / `response.cancelled` / 顶层 `error` | `error` chunk（`{"error":{"message":...}}`，不含 choices） |
-| 流在终态事件前结束（含上游 `[DONE]` 但无终态） | 补一个 `error` chunk，随后仍只发一个 `[DONE]` |
+| 流在终态事件前结束（未收到终态事件，也未收到上游 `[DONE]`） | 补一个 `error` chunk，随后仍只发一个 `[DONE]` |
 
 #### 非流式时怎么处理
 

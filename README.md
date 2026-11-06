@@ -292,6 +292,8 @@ sudo xattr -r -d com.apple.quarantine /Applications/Codex\ Tools.app
 
 注意：备份只覆盖项目清单与会话归属所在的 JSON；桌面端数据库（`state_5.sqlite`）不承诺恢复。已经丢失的归属如果没有历史备份，无法由工具自动找回。
 
+本版本在切换 ChatGPT 账号时还会把 `cli_auth_credentials_store = "file"` 写入托管的 Codex 配置，强制桌面端使用 `~/.codex/auth.json`，避免新版桌面端优先读取 macOS Keychain 里的旧凭据而导致“看起来切换了、实际仍是旧账号”。该配置会覆盖用户自行设置的 `keyring` 值。实测 Codex 0.153 及更新版本均识别该字段；如果你在设置里自定义了更旧的 `codex_launch_path`，旧版本可能把它当作未知字段而拒绝加载配置，请升级 Codex 或移除该自定义路径。
+
 以上优雅退出与项目状态备份目前只在 macOS 生效；Windows/Linux 仍按旧逻辑尽力结束进程，且不做项目状态备份。
 
 ### Cursor 无法访问本地地址
