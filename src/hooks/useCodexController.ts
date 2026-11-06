@@ -44,6 +44,7 @@ import {
   sortAccountsByRemaining,
 } from "../utils/accountRanking";
 import { accountCanBeCleaned } from "../utils/accountStatus";
+import { resolveUsageRefreshNotice } from "../utils/usageRefreshNotice";
 
 const REFRESH_MS = 30_000;
 const COST_ANALYTICS_REFRESH_MS = 60_000;
@@ -667,8 +668,14 @@ export function useCodexController() {
         if (requestId === usageRefreshSequenceRef.current) {
           setUsageRefreshError(null);
         }
-        if (!quiet && !promptedRelogin) {
-          setNotice({ type: "ok", message: copy.notices.usageRefreshed });
+        // 部分/全部账号失败时不再无条件提示“用量已刷新”；
+        // quiet（轮询/启动）与 promptedRelogin（applyAccounts 已弹重新登录）保持静默。
+        const usageNotice = resolveUsageRefreshNotice(data, copy, {
+          quiet,
+          promptedRelogin,
+        });
+        if (usageNotice) {
+          setNotice(usageNotice);
         }
       } catch (error) {
         const localizedError = localizeError(String(error));
@@ -697,7 +704,7 @@ export function useCodexController() {
         }
       }
     },
-    [applyAccounts, copy.notices, localizeError],
+    [applyAccounts, copy, localizeError],
   );
 
   const refreshTokenUsage = useCallback(
