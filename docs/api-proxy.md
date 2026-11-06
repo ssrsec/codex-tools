@@ -168,8 +168,11 @@ Tauri 命令入口在：
 特点：
 
 - 这里不是实时问上游拿模型
-- 目前返回本地静态模型列表：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.5`、`gpt-5.4`、`gpt-image-2`
-- `gpt-5.6`、`gpt5.6`、`gpt-5-6` 会映射到 `gpt-5.6-sol`
+- 目前返回本地静态模型列表（11 项）：`gpt-6-astra`、`gpt-6.1-sol`、`gpt-6.1-terra`、`gpt-6-sol`、`gpt-6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.5`、`gpt-5.4`、`gpt-image-2`
+- `gpt-6`/`gpt6` 会映射到 `gpt-6-astra`；`gpt-6.1`/`gpt6.1`/`gpt-6-1` 会映射到 `gpt-6.1-sol`；`gpt-6.1-terra` 及其 `gpt6.1-terra`/`gpt-6-1-terra` 写法会保留为 `gpt-6.1-terra`（不会被 `gpt-6.1` 别名吞掉）
+- `gpt-5.6`、`gpt5.6`、`gpt-5-6` 会映射到 `gpt-5.6-sol`；`gpt-5.5`/`gpt-5.4` 的常见历史写法同样兼容
+- 带 `-YYYY-MM-DD` 日期快照后缀的模型名会按所属模型族做权限/开关判定（请求本身仍按原模型名转发）
+- 本机反代请求使用与 Codex 0.159 对齐的客户端身份；模型选择器是否需要额外的 Codex 模型目录同步不在本代理范围内
 - 目的是让大多数依赖 `/v1/models` 的客户端能正常初始化
 
 推理与速度参数：
@@ -180,6 +183,7 @@ Tauri 命令入口在：
 - 请求未指定时默认使用 `xhigh` 与反代设置中的“默认速度”（初始为 `default`）
 - `ultra` 属于 Codex 客户端的多代理编排模式；反代收到该兼容值时按实际推理 wire 值 `max` 发送
 - GPT-5.6 的官方推理强度为 `none`、`low`、`medium`、`high`、`xhigh`、`max`；`minimal` 仅保留给旧模型兼容，GPT-5.6 请求会明确拒绝
+- GPT-6 系（Astra、6.1 Sol/Terra、6 Sol/Luna）使用 Responses Lite 契约，支持 `low`、`medium`、`high`、`xhigh`、`max`，`ultra` 统一映射为 `max`，并明确拒绝 `none`/`minimal`
 - 具体模型可用档位仍以上游能力为准；代理会拒绝未知值，不会静默降级
 
 ### 6.3 `POST /v1/chat/completions`
@@ -204,7 +208,7 @@ Tauri 命令入口在：
 
 行为：
 
-- 非 GPT-5.6 请求体只做必要归一化；GPT-5.6 会转换为 Responses Lite 结构
+- 非 GPT-6/GPT-5.6 请求体只做必要归一化；GPT-6 系与 GPT-5.6 会转换为 Responses Lite 结构
 - 上游仍然统一发到 Codex `responses`
 - `stream: true` 时近似透传 SSE
 - `stream: false` 时从 SSE 中提取 `response.completed`，返回标准 JSON
@@ -504,7 +508,10 @@ OpenAI 里的：
 | `response.function_call_arguments.delta` | `delta.tool_calls[].function.arguments` 增量 |
 | `response.function_call_arguments.done` | 参数结束兜底 |
 | `response.output_item.done` with `function_call` | 工具调用完成兜底 |
-| `response.completed` | `finish_reason` + `[DONE]` |
+| `response.completed` / `response.done` | `finish_reason` + `[DONE]` |
+| `response.incomplete`（或 completed 且 status=incomplete） | `max_output_tokens` → `length`；`content_filter` → `content_filter`；其它原因 → `error` chunk |
+| `response.failed` / `response.cancelled` / 顶层 `error` | `error` chunk（`{"error":{"message":...}}`，不含 choices） |
+| 流在终态事件前结束（含上游 `[DONE]` 但无终态） | 补一个 `error` chunk，随后仍只发一个 `[DONE]` |
 
 #### 非流式时怎么处理
 
@@ -683,8 +690,9 @@ Cloudflared 不参与：
 - 其他 `/v1/*` 路径目前直接返回不支持
 - 模型列表是本地静态表，不是实时探测
 - `/v1/responses` 的流式是近似透传，不额外做深层语义改写
-- GPT-5.6 Responses Lite 不接收 hosted `web_search`、`web_search_preview`、`image_generation` 工具；这类请求会明确拒绝，客户端扩展工具仍会透传
+- GPT-6/GPT-5.6 Responses Lite 不接收 hosted `web_search`、`web_search_preview`、`image_generation` 工具；这类请求会明确拒绝，客户端扩展工具仍会透传
 - 远程图片 URL 会替换为占位文本，Lite 请求不会发送图片 `detail`
+- `/v1/chat/completions` 的流式终止语义已覆盖 `completed/done/incomplete/failed/cancelled/error` 与“未终止流补 error”；非流式仍从完整 SSE 中提取 `response.completed`，遇到 `incomplete`/`failed` 会返回错误而非静默成功
 - 核心目标是把最常用的聊天链路稳定打通
 
 ## 20. 代码位置索引
