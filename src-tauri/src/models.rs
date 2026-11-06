@@ -1138,11 +1138,12 @@ fn merge_duplicate_account_variant(left: StoredAccount, right: StoredAccount) ->
     if preferred.usage_error.is_none() {
         preferred.usage_error = alternate.usage_error.clone();
     }
-    if !preferred.auth_refresh_blocked && alternate.auth_refresh_blocked {
-        preferred.auth_refresh_blocked = true;
-    }
-    if preferred.auth_refresh_error.is_none() {
+    // 去重时不能让 alternate 的 blocked 状态“复活”健康的 preferred：
+    // 只有 preferred 自己就是 blocked 且缺文案时，才继承 alternate 的错误文案。
+    if preferred.auth_refresh_blocked && preferred.auth_refresh_error.is_none() {
         preferred.auth_refresh_error = alternate.auth_refresh_error.clone();
+    } else if !preferred.auth_refresh_blocked {
+        preferred.auth_refresh_error = None;
     }
     preferred.api_proxy_enabled = preferred.api_proxy_enabled && alternate.api_proxy_enabled;
     if preferred.auth_json.is_null() && !alternate.auth_json.is_null() {
@@ -1184,8 +1185,8 @@ fn merge_duplicate_account_variant(left: StoredAccount, right: StoredAccount) ->
 
 fn duplicate_account_merge_score(account: &StoredAccount) -> (u8, u8, u8, u8, i64, i64) {
     (
-        u8::from(account.usage.is_some() && account.usage_error.is_none()),
         u8::from(!account.auth_refresh_blocked),
+        u8::from(account.usage.is_some() && account.usage_error.is_none()),
         u8::from(account.resolved_plan_type().is_some()),
         u8::from(
             account
@@ -1676,6 +1677,107 @@ mod tests {
         assert_eq!(accounts[0].label, "fresh");
         assert_eq!(accounts[0].added_at, 99);
         assert_eq!(accounts[0].updated_at, 200);
+    }
+
+    #[test]
+    fn dedupe_does_not_revive_blocked_state_from_alternate() {
+        let healthy = stored_account(
+            "healthy",
+            "healthy",
+            "account-1",
+            Some("pro"),
+            Some("pro"),
+            200,
+        );
+        let mut blocked = stored_account(
+            "blocked",
+            "blocked",
+            "account-1",
+            Some("pro"),
+            Some("pro"),
+            100,
+        );
+        blocked.auth_refresh_blocked = true;
+        blocked.auth_refresh_error = Some("refresh_token_reused".to_string());
+
+        let mut accounts = vec![healthy, blocked];
+        assert!(dedupe_account_variants(&mut accounts));
+
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, "healthy");
+        assert!(
+            !accounts[0].auth_refresh_blocked,
+            "健康 preferred 不能被 alternate 的 blocked 状态复活"
+        );
+        assert_eq!(
+            accounts[0].auth_refresh_error, None,
+            "健康 preferred 不应继承 alternate 的错误文案"
+        );
+    }
+
+    #[test]
+    fn dedupe_inherits_blocked_error_when_preferred_is_blocked_without_error() {
+        let mut preferred = stored_account(
+            "blocked-new",
+            "blocked-new",
+            "account-1",
+            Some("pro"),
+            Some("pro"),
+            200,
+        );
+        preferred.auth_refresh_blocked = true;
+        let mut alternate = stored_account(
+            "blocked-old",
+            "blocked-old",
+            "account-1",
+            Some("pro"),
+            Some("pro"),
+            100,
+        );
+        alternate.auth_refresh_blocked = true;
+        alternate.auth_refresh_error = Some("refresh token expired".to_string());
+
+        let mut accounts = vec![preferred, alternate];
+        assert!(dedupe_account_variants(&mut accounts));
+
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, "blocked-new");
+        assert!(accounts[0].auth_refresh_blocked);
+        assert_eq!(
+            accounts[0].auth_refresh_error.as_deref(),
+            Some("refresh token expired"),
+            "preferred 已 blocked 且无文案时应继承 alternate 的错误文案"
+        );
+    }
+
+    #[test]
+    fn dedupe_account_variants_does_not_reintroduce_a_stale_refresh_block() {
+        let mut healthy =
+            stored_account("healthy", "healthy", "account-1", Some("team"), None, 100);
+        healthy.auth_json = json!({ "kind": "healthy-auth" });
+
+        let mut stale_blocked = stored_account(
+            "blocked",
+            "blocked",
+            "account-1",
+            Some("team"),
+            Some("team"),
+            200,
+        );
+        stale_blocked.auth_json = json!({ "kind": "stale-auth" });
+        stale_blocked.auth_refresh_blocked = true;
+        stale_blocked.auth_refresh_error = Some("stale refresh failure".to_string());
+
+        let mut accounts = vec![stale_blocked, healthy];
+        let changed = dedupe_account_variants(&mut accounts);
+
+        assert!(changed);
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, "healthy");
+        assert!(accounts[0].usage.is_some());
+        assert!(!accounts[0].auth_refresh_blocked);
+        assert!(accounts[0].auth_refresh_error.is_none());
+        assert_eq!(accounts[0].auth_json, json!({ "kind": "healthy-auth" }));
     }
 
     #[test]
