@@ -114,8 +114,8 @@ const PROXY_MODEL_RESTRICTION_COOLDOWN_SECONDS: i64 = 86_400;
 const DESKTOP_API_PROXY_BIND_HOST: &str = "0.0.0.0";
 const MAX_PROXY_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
 const PROXY_REQUEST_BODY_LIMIT_MIB_ENV_VAR: &str = "CODEX_TOOLS_PROXY_MAX_BODY_MIB";
-const CODEX_CLIENT_VERSION: &str = "0.144.0";
-const CODEX_USER_AGENT: &str = "codex_cli_rs/0.144.0";
+const CODEX_CLIENT_VERSION: &str = "0.159.0";
+const CODEX_USER_AGENT: &str = "codex_cli_rs/0.159.0";
 const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 const ANTHROPIC_MESSAGES_REQUIRED_VERSION: &str = "2023-06-01";
 const SSE_DONE: &str = "data: [DONE]\n\n";
@@ -125,6 +125,11 @@ const DEFAULT_UPSTREAM_SERVICE_TIER: &str = "default";
 const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 const IMAGE_VARIATION_PROMPT: &str = "Create a faithful variation of the provided image.";
 const MODELS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -132,25 +137,29 @@ const MODELS: &[&str] = &[
     "gpt-5.4",
     "gpt-image-2",
 ];
-const REQUEST_MODEL_MAPPINGS: &[(&str, &str)] = &[
-    ("gpt-5.6-sol", "gpt-5.6-sol"),
-    ("gpt-5.6-terra", "gpt-5.6-terra"),
-    ("gpt-5.6-luna", "gpt-5.6-luna"),
-    ("gpt5.6-sol", "gpt-5.6-sol"),
-    ("gpt-5-6-sol", "gpt-5.6-sol"),
-    ("gpt5.6-terra", "gpt-5.6-terra"),
-    ("gpt-5-6-terra", "gpt-5.6-terra"),
-    ("gpt5.6-luna", "gpt-5.6-luna"),
-    ("gpt-5-6-luna", "gpt-5.6-luna"),
-    ("gpt5.6", "gpt-5.6-sol"),
-    ("gpt-5-6", "gpt-5.6-sol"),
-    ("gpt-5.6", "gpt-5.6-sol"),
-    ("gpt5.5", "gpt-5.5"),
-    ("gpt-5-5", "gpt-5.5"),
-    ("gpt5.4", "gpt-5.4"),
-    ("gpt-5-4", "gpt-5.4"),
-];
-const RESPONSE_MODEL_NORMALIZATIONS: &[(&str, &str)] = &[
+// Single source of truth for request aliases and response model rewriting.
+// Order matters: remap_model_name falls back to prefix matching, so exact
+// family names must precede bare aliases (gpt-6, gpt-6.1). The GPT-6.1 Terra
+// entries are first for the same reason; otherwise gpt-6.1-terra would be
+// rewritten to gpt-6.1-sol-terra.
+const MODEL_MAPPINGS: &[(&str, &str)] = &[
+    ("gpt-6.1-terra", "gpt-6.1-terra"),
+    ("gpt6.1-terra", "gpt-6.1-terra"),
+    ("gpt-6-1-terra", "gpt-6.1-terra"),
+    ("gpt-6.1-sol", "gpt-6.1-sol"),
+    ("gpt6.1-sol", "gpt-6.1-sol"),
+    ("gpt-6-1-sol", "gpt-6.1-sol"),
+    ("gpt-6.1", "gpt-6.1-sol"),
+    ("gpt6.1", "gpt-6.1-sol"),
+    ("gpt-6-1", "gpt-6.1-sol"),
+    ("gpt-6-astra", "gpt-6-astra"),
+    ("gpt6-astra", "gpt-6-astra"),
+    ("gpt-6-sol", "gpt-6-sol"),
+    ("gpt6-sol", "gpt-6-sol"),
+    ("gpt-6-luna", "gpt-6-luna"),
+    ("gpt6-luna", "gpt-6-luna"),
+    ("gpt6", "gpt-6-astra"),
+    ("gpt-6", "gpt-6-astra"),
     ("gpt-5.6-sol", "gpt-5.6-sol"),
     ("gpt-5.6-terra", "gpt-5.6-terra"),
     ("gpt-5.6-luna", "gpt-5.6-luna"),
@@ -468,6 +477,13 @@ struct ChatStreamState {
     function_call_index: i64,
     has_received_arguments_delta: bool,
     has_tool_call_announced: bool,
+    // Set once a terminal Responses event (or upstream `[DONE]` sentinel) has
+    // been translated. Later deltas are dropped to keep exactly one terminal
+    // chunk per downstream stream.
+    terminal_seen: bool,
+    // Tracks whether an error chunk was emitted, so the end-of-stream guard
+    // does not duplicate it when the transport ends without a terminal event.
+    terminal_error_emitted: bool,
 }
 
 impl Default for ChatStreamState {
@@ -480,6 +496,8 @@ impl Default for ChatStreamState {
             function_call_index: -1,
             has_received_arguments_delta: false,
             has_tool_call_announced: false,
+            terminal_seen: false,
+            terminal_error_emitted: false,
         }
     }
 }
@@ -1791,19 +1809,12 @@ async fn send_responses_websocket_error(
         .map_err(|error| format!("发送 WebSocket 错误帧失败: {error}"))
 }
 
-fn is_responses_terminal_event(event: &SseEvent) -> bool {
-    let event_type = serde_json::from_str::<Value>(&event.data)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("type")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
-        .or_else(|| event.event.clone());
-
+// Shared terminal classification for Responses SSE events. `error` is included
+// so a top-level error event terminates both WebSocket relaying and the Chat
+// Completions translation instead of being silently dropped.
+fn responses_event_type_is_terminal(event_type: Option<&str>) -> bool {
     matches!(
-        event_type.as_deref(),
+        event_type,
         Some(
             "response.completed"
                 | "response.done"
@@ -1811,8 +1822,34 @@ fn is_responses_terminal_event(event: &SseEvent) -> bool {
                 | "response.incomplete"
                 | "response.cancelled"
                 | "response.canceled"
+                | "error"
         )
     )
+}
+
+fn sse_event_is_done_sentinel(event: &SseEvent) -> bool {
+    event.data.trim() == "[DONE]"
+}
+
+fn responses_event_type(event: &SseEvent) -> Option<String> {
+    if sse_event_is_done_sentinel(event) {
+        return Some("[DONE]".to_string());
+    }
+    serde_json::from_str::<Value>(&event.data)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| event.event.clone())
+}
+
+fn is_responses_terminal_event(event: &SseEvent) -> bool {
+    let event_type = responses_event_type(event);
+    let event_type = event_type.as_deref();
+    event_type == Some("[DONE]") || responses_event_type_is_terminal(event_type)
 }
 
 async fn unsupported_proxy_handler(
@@ -2908,7 +2945,7 @@ fn collect_images_from_response_value(value: &Value, data: &mut Vec<Value>) {
 }
 
 fn map_client_model_to_upstream(model: &str) -> Result<String, String> {
-    Ok(remap_model_name(model, REQUEST_MODEL_MAPPINGS).unwrap_or_else(|| model.to_string()))
+    Ok(remap_model_name(model, MODEL_MAPPINGS).unwrap_or_else(|| model.to_string()))
 }
 
 fn request_model_or_default(object: &Map<String, Value>) -> Result<String, String> {
@@ -2946,9 +2983,18 @@ fn request_reasoning_effort(object: &Map<String, Value>) -> Result<Option<&str>,
 }
 
 fn is_responses_lite_model(model: &str) -> bool {
-    ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
-        .iter()
-        .any(|prefix| model == *prefix || model.starts_with(&format!("{prefix}-")))
+    [
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6.1-terra",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ]
+    .iter()
+    .any(|prefix| model == *prefix || model.starts_with(&format!("{prefix}-")))
 }
 
 fn payload_uses_responses_lite(payload: &Value) -> bool {
@@ -2958,6 +3004,50 @@ fn payload_uses_responses_lite(payload: &Value) -> bool {
         .is_some_and(is_responses_lite_model)
 }
 
+fn model_matches_family(model: &str, family: &str) -> bool {
+    model == family || model.starts_with(&format!("{family}-"))
+}
+
+// GPT-6 families only advertise low..max efforts; GPT-5.6 keeps accepting
+// `none` for compatibility but still rejects `minimal`. `ultra` has already
+// been mapped to `max` by the global effort normalizer before this runs.
+fn validate_reasoning(model: &str, effort: Option<&str>) -> Result<(), String> {
+    let normalized = effort.map(|value| value.trim().to_ascii_lowercase());
+    let effort = normalized.as_deref();
+    if model_matches_family(model, "gpt-6.1-sol") || model_matches_family(model, "gpt-6.1-terra") {
+        if matches!(effort, Some("none" | "minimal")) {
+            return Err(
+                "GPT-6.1 Sol/Terra 支持 low、medium、high、xhigh、max 推理强度；ultra 映射为 max"
+                    .to_string(),
+            );
+        }
+    }
+    if model_matches_family(model, "gpt-6-astra") {
+        if matches!(effort, Some("none" | "minimal")) {
+            return Err(
+                "GPT-6 Astra 支持 low、medium、high、xhigh、max 推理强度；ultra 映射为 max"
+                    .to_string(),
+            );
+        }
+    }
+    if model_matches_family(model, "gpt-6-sol") || model_matches_family(model, "gpt-6-luna") {
+        if matches!(effort, Some("none" | "minimal")) {
+            return Err(
+                "GPT-6 Sol/Luna 的 Codex 模型目录支持 low、medium、high、xhigh、max 推理强度；\
+                 ultra 映射为 max"
+                    .to_string(),
+            );
+        }
+    }
+    if is_responses_lite_model(model) && effort == Some("minimal") {
+        return Err(
+            "此模型不支持 minimal 推理强度；请使用 none、low、medium、high、xhigh 或 max"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn normalize_responses_lite_payload(object: &mut Map<String, Value>) -> Result<(), String> {
     let Some(model) = object.get("model").and_then(Value::as_str) else {
         return Ok(());
@@ -2965,25 +3055,21 @@ fn normalize_responses_lite_payload(object: &mut Map<String, Value>) -> Result<(
     if !is_responses_lite_model(model) {
         return Ok(());
     }
-    if object
-        .get("reasoning")
-        .and_then(|reasoning| reasoning.get("effort"))
-        .and_then(Value::as_str)
-        == Some("minimal")
-    {
-        return Err(
-            "GPT-5.6 不支持 minimal 推理强度；请使用 none、low、medium、high、xhigh 或 max"
-                .to_string(),
-        );
-    }
+    validate_reasoning(
+        model,
+        object
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort"))
+            .and_then(Value::as_str),
+    )?;
 
     if object.contains_key("tools") && !object.get("tools").is_some_and(Value::is_array) {
-        return Err("GPT-5.6 Responses Lite 的 tools 必须是数组".to_string());
+        return Err("Responses Lite 的 tools 必须是数组".to_string());
     }
     if object.contains_key("instructions")
         && !object.get("instructions").is_some_and(Value::is_string)
     {
-        return Err("GPT-5.6 Responses Lite 的 instructions 必须是字符串".to_string());
+        return Err("Responses Lite 的 instructions 必须是字符串".to_string());
     }
 
     let extra_tools = object
@@ -3011,9 +3097,7 @@ fn normalize_responses_lite_payload(object: &mut Map<String, Value>) -> Result<(
                 .and_then(Value::as_str)
                 != Some("additional_tools"))
     {
-        return Err(
-            "GPT-5.6 Responses Lite 的 additional_tools 必须且只能位于 input 首项".to_string(),
-        );
+        return Err("Responses Lite 的 additional_tools 必须且只能位于 input 首项".to_string());
     }
 
     let already_has_additional_tools = input
@@ -3030,7 +3114,7 @@ fn normalize_responses_lite_payload(object: &mut Map<String, Value>) -> Result<(
             .and_then(|item| item.get("tools"))
             .is_some_and(Value::is_array);
         if !tools_are_array {
-            return Err("GPT-5.6 Responses Lite 的 additional_tools.tools 必须是数组".to_string());
+            return Err("Responses Lite 的 additional_tools.tools 必须是数组".to_string());
         }
         if let Some(item) = input.first_mut().and_then(Value::as_object_mut) {
             item.insert("role".to_string(), Value::String("developer".to_string()));
@@ -3072,7 +3156,7 @@ fn normalize_responses_lite_payload(object: &mut Map<String, Value>) -> Result<(
 
     if let Some(tool_type) = responses_lite_unsupported_hosted_tool(&input) {
         return Err(format!(
-            "GPT-5.6 Responses Lite 不支持 hosted tool 类型 {tool_type}；请使用客户端扩展工具"
+            "Responses Lite 不支持 hosted tool 类型 {tool_type}；请使用客户端扩展工具"
         ));
     }
 
@@ -3128,7 +3212,7 @@ fn responses_lite_input_items(input: Option<Value>) -> Result<Vec<Value>, String
             }],
         })]),
         Some(Value::Null) | None => Ok(Vec::new()),
-        Some(_) => Err("GPT-5.6 Responses Lite 的 input 必须是字符串或数组".to_string()),
+        Some(_) => Err("Responses Lite 的 input 必须是字符串或数组".to_string()),
     }
 }
 
@@ -3558,7 +3642,7 @@ fn websocket_event_is_terminal(data: &str) -> bool {
 }
 
 fn normalize_model_for_client(model: &str) -> String {
-    remap_model_name(model, RESPONSE_MODEL_NORMALIZATIONS).unwrap_or_else(|| model.to_string())
+    remap_model_name(model, MODEL_MAPPINGS).unwrap_or_else(|| model.to_string())
 }
 
 fn remap_model_name(model: &str, mappings: &[(&str, &str)]) -> Option<String> {
@@ -3574,6 +3658,35 @@ fn remap_model_name(model: &str, mappings: &[(&str, &str)]) -> Option<String> {
     }
 
     None
+}
+
+fn is_dated_snapshot_suffix(suffix: &str) -> bool {
+    let bytes = suffix.as_bytes();
+    bytes.len() == 11
+        && bytes[0] == b'-'
+        && bytes[5] == b'-'
+        && bytes[8] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 0 | 5 | 8) || byte.is_ascii_digit())
+}
+
+// Resolution used by control panels (disabled models / Key allowlists): map
+// aliases first, then fold a dated snapshot such as gpt-6.1-terra-2026-01-01
+// onto its catalog family. The wire model itself is never rewritten here.
+fn normalize_model_for_permissions(model: &str) -> String {
+    let normalized = normalize_model_for_client(model);
+    MODELS
+        .iter()
+        .find(|base| {
+            normalized == **base
+                || normalized
+                    .strip_prefix(**base)
+                    .is_some_and(is_dated_snapshot_suffix)
+        })
+        .map(|base| (*base).to_string())
+        .unwrap_or(normalized)
 }
 
 fn rewrite_response_models_for_client(mut value: Value) -> Value {
@@ -4475,8 +4588,7 @@ fn normalize_api_proxy_config_model_name(model: &str) -> Option<String> {
         return None;
     }
 
-    let upstream = map_client_model_to_upstream(trimmed).unwrap_or_else(|_| trimmed.to_string());
-    Some(normalize_model_for_client(&upstream))
+    Some(normalize_model_for_permissions(trimmed))
 }
 
 fn api_proxy_disabled_model_set(settings: &AppSettings) -> HashSet<String> {
@@ -6277,6 +6389,18 @@ fn build_chat_streaming_response(
             }
         }
 
+        // A stream that ends without any terminal event must not look like a
+        // successful empty completion. The transport-error branch above already
+        // emitted its own error chunk and returned, so only this final guard can
+        // add one here; `[DONE]` is still emitted exactly once below.
+        if !state.terminal_seen && !state.terminal_error_emitted {
+            yield Ok::<Bytes, Infallible>(sse_data_chunk(&json!({
+                "error": {
+                    "message": "上游流在终态事件前结束",
+                },
+            })));
+        }
+
         yield Ok::<Bytes, Infallible>(Bytes::from_static(SSE_DONE.as_bytes()));
     };
 
@@ -7210,12 +7334,25 @@ fn stop_anthropic_tool_block(state: &mut AnthropicStreamState) -> Vec<Value> {
 }
 
 fn translate_sse_event_to_chat_chunk(event: &SseEvent, state: &mut ChatStreamState) -> Vec<Value> {
+    // Latch first: once a terminal event was translated, later deltas must not
+    // leak into the downstream stream.
+    if state.terminal_seen {
+        return Vec::new();
+    }
+    if sse_event_is_done_sentinel(event) {
+        state.terminal_seen = true;
+        return Vec::new();
+    }
     let Ok(parsed) = serde_json::from_str::<Value>(&event.data) else {
         return Vec::new();
     };
     let Some(kind) = parsed.get("type").and_then(Value::as_str) else {
         return Vec::new();
     };
+    if responses_event_type_is_terminal(Some(kind)) {
+        state.terminal_seen = true;
+        return translate_terminal_chat_chunk(&parsed, kind, state);
+    }
 
     match kind {
         "response.created" => {
@@ -7373,24 +7510,99 @@ fn translate_sse_event_to_chat_chunk(event: &SseEvent, state: &mut ChatStreamSta
                 parsed.get("response").and_then(|value| value.get("usage")),
             )]
         }
-        "response.completed" => {
-            let finish_reason = if state.function_call_index >= 0 {
-                "tool_calls"
-            } else {
-                "stop"
-            };
-            vec![build_chat_chunk(
-                state,
-                json!({}),
-                Some(finish_reason),
-                parsed.get("response").and_then(|value| value.get("usage")),
-            )]
-        }
         _ => {
             let _ = &event.event;
             Vec::new()
         }
     }
+}
+
+fn translate_terminal_chat_chunk(
+    parsed: &Value,
+    kind: &str,
+    state: &mut ChatStreamState,
+) -> Vec<Value> {
+    let response = parsed.get("response").unwrap_or(parsed);
+    let status = response.get("status").and_then(Value::as_str).unwrap_or("");
+    let failed_status = matches!(status, "failed" | "cancelled" | "canceled");
+    if matches!(
+        kind,
+        "response.failed" | "response.cancelled" | "response.canceled" | "error"
+    ) || failed_status
+    {
+        state.terminal_error_emitted = true;
+        return vec![build_chat_stream_error(parsed, response, "上游响应失败")];
+    }
+
+    if kind == "response.incomplete" || status == "incomplete" {
+        let reason = response
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str);
+        return match reason {
+            Some("max_output_tokens") => vec![build_chat_chunk(
+                state,
+                json!({}),
+                Some("length"),
+                response.get("usage"),
+            )],
+            Some("content_filter") => vec![build_chat_chunk(
+                state,
+                json!({}),
+                Some("content_filter"),
+                response.get("usage"),
+            )],
+            Some(other) => {
+                state.terminal_error_emitted = true;
+                vec![json!({
+                    "error": {
+                        "message": format!("上游响应未完成: {other}"),
+                    },
+                })]
+            }
+            None => {
+                state.terminal_error_emitted = true;
+                vec![json!({
+                    "error": {
+                        "message": "上游响应未完成",
+                    },
+                })]
+            }
+        };
+    }
+
+    let finish_reason = if state.function_call_index >= 0 {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    vec![build_chat_chunk(
+        state,
+        json!({}),
+        Some(finish_reason),
+        response.get("usage"),
+    )]
+}
+
+fn build_chat_stream_error(parsed: &Value, response: &Value, fallback: &str) -> Value {
+    let message = response
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            parsed
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| parsed.get("message").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .unwrap_or(fallback);
+    json!({
+        "error": {
+            "message": message,
+        },
+    })
 }
 
 fn build_chat_chunk(
@@ -7784,6 +7996,7 @@ mod tests {
     use super::append_api_proxy_usage_event;
     use super::apply_api_proxy_default_service_tier;
     use super::build_api_proxy_usage_stats;
+    use super::build_chat_streaming_response;
     use super::convert_anthropic_messages_request_to_codex;
     use super::convert_completed_response_to_anthropic_message;
     use super::convert_completed_response_to_chat_completion;
@@ -7799,8 +8012,12 @@ mod tests {
     use super::find_http_header_end;
     use super::get_api_proxy_key_usage_logs_with_storage;
     use super::host_matches_no_proxy;
+    use super::is_responses_lite_model;
     use super::is_responses_terminal_event;
     use super::list_api_proxy_keys_with_storage;
+    use super::map_client_model_to_upstream;
+    use super::new_proxy_storage_context;
+    use super::normalize_api_proxy_config_model_name;
     use super::normalize_openai_responses_request;
     use super::normalize_responses_websocket_create;
     use super::now_unix_seconds;
@@ -7824,7 +8041,9 @@ mod tests {
     use super::websocket_target_host_port;
     use super::AnthropicStreamState;
     use super::ApiProxyUsageEvent;
+    use super::ApiProxyUsageMetadata;
     use super::ChatStreamState;
+    use super::CodexUpstreamResponse;
     use super::ImageMultipartRequest;
     use super::ProxyCandidate;
     use super::ProxyLoadBalanceConfig;
@@ -8179,6 +8398,11 @@ mod tests {
         assert_eq!(
             super::get_api_proxy_supported_models_internal(),
             vec![
+                "gpt-6-astra",
+                "gpt-6.1-sol",
+                "gpt-6.1-terra",
+                "gpt-6-sol",
+                "gpt-6-luna",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
@@ -9236,7 +9460,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_lite_forces_codex_0144_identity_while_classic_preserves_client_identity() {
+    fn responses_lite_forces_codex_0159_identity_while_classic_preserves_client_identity() {
         let mut headers = HeaderMap::new();
         headers.insert("version", HeaderValue::from_static("0.125.0"));
         headers.insert(
@@ -9246,7 +9470,7 @@ mod tests {
 
         assert_eq!(
             super::upstream_codex_client_identity(&headers, true),
-            ("0.144.0", "codex_cli_rs/0.144.0")
+            ("0.159.0", "codex_cli_rs/0.159.0")
         );
         assert_eq!(
             super::upstream_codex_client_identity(&headers, false),
@@ -9732,6 +9956,22 @@ mod tests {
         };
 
         assert!(is_responses_terminal_event(&event));
+
+        // Top-level error events are terminal for both WebSocket relaying and
+        // the Chat Completions translation.
+        let error_event = SseEvent {
+            event: None,
+            data: "{\"type\":\"error\",\"error\":{\"message\":\"boom\"}}".to_string(),
+        };
+        assert!(is_responses_terminal_event(&error_event));
+
+        // Upstream `[DONE]` sentinel is treated as terminal defensively so a
+        // stream that ends with it is not reported as unterminated.
+        let done_event = SseEvent {
+            event: None,
+            data: "[DONE]".to_string(),
+        };
+        assert!(is_responses_terminal_event(&done_event));
     }
 
     #[test]
@@ -10493,5 +10733,390 @@ data: {"type":"response.completed","response":{"id":"resp_123","created_at":1,"m
             resolve_proxy_request_body_limit_bytes_from_mib_value(Some("1")),
             1024 * 1024
         );
+    }
+
+    // ---- PR3: GPT-6 model catalog / aliases / Responses Lite / reasoning ----
+
+    #[test]
+    fn maps_gpt_6_aliases_including_terra_without_swallowing() {
+        for (requested, expected) in [
+            ("gpt-6.1-terra", "gpt-6.1-terra"),
+            ("gpt6.1-terra", "gpt-6.1-terra"),
+            ("gpt-6-1-terra", "gpt-6.1-terra"),
+            ("gpt-6.1-terra-2026-01-01", "gpt-6.1-terra-2026-01-01"),
+            ("gpt-6.1-sol", "gpt-6.1-sol"),
+            ("gpt6.1-sol", "gpt-6.1-sol"),
+            ("gpt-6-1-sol", "gpt-6.1-sol"),
+            ("gpt-6.1", "gpt-6.1-sol"),
+            ("gpt6.1", "gpt-6.1-sol"),
+            ("gpt-6-1", "gpt-6.1-sol"),
+            ("gpt-6-astra", "gpt-6-astra"),
+            ("gpt6-astra", "gpt-6-astra"),
+            ("gpt-6-sol", "gpt-6-sol"),
+            ("gpt6-sol", "gpt-6-sol"),
+            ("gpt-6-luna", "gpt-6-luna"),
+            ("gpt6-luna", "gpt-6-luna"),
+            ("gpt6", "gpt-6-astra"),
+            ("gpt-6", "gpt-6-astra"),
+            ("gpt-5.6", "gpt-5.6-sol"),
+            ("gpt5.5", "gpt-5.5"),
+            ("gpt-5-4", "gpt-5.4"),
+            ("my-model", "my-model"),
+        ] {
+            assert_eq!(
+                map_client_model_to_upstream(requested).unwrap(),
+                expected,
+                "{requested}"
+            );
+        }
+        // Red-green guard for P0-1: the bare `gpt-6.1` alias must not rewrite
+        // terra into `gpt-6.1-sol-terra`.
+        assert_ne!(
+            map_client_model_to_upstream("gpt-6.1-terra").unwrap(),
+            "gpt-6.1-sol-terra"
+        );
+    }
+
+    #[test]
+    fn treats_gpt_6_models_as_responses_lite() {
+        for model in [
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ] {
+            assert!(is_responses_lite_model(model), "{model}");
+        }
+        for model in ["gpt-5.5", "gpt-5.4", "gpt-image-2", "my-model"] {
+            assert!(!is_responses_lite_model(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn validates_reasoning_per_gpt_6_family() {
+        for model in [
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+        ] {
+            for effort in ["none", "minimal"] {
+                let request = json!({
+                    "model": model,
+                    "input": "hello",
+                    "reasoning": { "effort": effort }
+                });
+                let error = normalize_openai_responses_request(request)
+                    .expect_err("GPT-6 families must reject none/minimal");
+                assert!(error.contains("推理强度"), "{model} {effort}: {error}");
+            }
+            for effort in ["low", "medium", "high", "xhigh", "max", "ultra"] {
+                let request = json!({
+                    "model": model,
+                    "input": "hello",
+                    "reasoning": { "effort": effort }
+                });
+                normalize_openai_responses_request(request)
+                    .unwrap_or_else(|error| panic!("{model} {effort}: {error}"));
+            }
+        }
+
+        // GPT-5.6 keeps accepting `none` and still rejects only `minimal`.
+        normalize_openai_responses_request(json!({
+            "model": "gpt-5.6-sol",
+            "input": "hello",
+            "reasoning": { "effort": "none" }
+        }))
+        .expect("GPT-5.6 none stays accepted");
+        let error = normalize_openai_responses_request(json!({
+            "model": "gpt-5.6-sol",
+            "input": "hello",
+            "reasoning": { "effort": "minimal" }
+        }))
+        .expect_err("GPT-5.6 minimal stays rejected");
+        assert!(error.contains("minimal"));
+
+        // `ultra` is mapped to `max` before family validation runs.
+        let (payload, _) = normalize_openai_responses_request(json!({
+            "model": "gpt-6-astra",
+            "input": "hello",
+            "reasoning": { "effort": "ultra" }
+        }))
+        .expect("ultra accepted for GPT-6");
+        assert_eq!(payload["reasoning"]["effort"], "max");
+    }
+
+    #[test]
+    fn normalizes_dated_models_for_permissions_and_allowlists() {
+        assert_eq!(
+            normalize_api_proxy_config_model_name("gpt-6.1-terra-2026-01-01").as_deref(),
+            Some("gpt-6.1-terra")
+        );
+        assert_eq!(
+            normalize_api_proxy_config_model_name("gpt6.1-terra").as_deref(),
+            Some("gpt-6.1-terra")
+        );
+        // Malformed suffixes are never folded onto a family.
+        assert_eq!(
+            normalize_api_proxy_config_model_name("gpt-6.1-terra-2026-1-1").as_deref(),
+            Some("gpt-6.1-terra-2026-1-1")
+        );
+        assert_eq!(
+            normalize_api_proxy_config_model_name("my-model").as_deref(),
+            Some("my-model")
+        );
+
+        let settings = AppSettings {
+            api_proxy_disabled_models: vec!["gpt-6.1-terra".to_string()],
+            ..AppSettings::default()
+        };
+        let dated_payload = json!({
+            "model": "gpt-6.1-terra-2026-01-01",
+            "input": "hello"
+        });
+        let error = ensure_api_proxy_payload_models_enabled(&dated_payload, &settings)
+            .expect_err("dated terra must hit the disabled family");
+        assert!(error.contains("gpt-6.1-terra"));
+
+        let allowed_key = api_proxy_key(vec!["gpt-6.1-terra"], vec![], vec![]);
+        ensure_api_proxy_key_allows_payload(&allowed_key, &dated_payload)
+            .expect("family allowlist must permit the dated payload");
+        let other_key = api_proxy_key(vec!["gpt-6.1-sol"], vec![], vec![]);
+        let error = ensure_api_proxy_key_allows_payload(&other_key, &dated_payload)
+            .expect_err("another family stays blocked");
+        // The request model is reported after permission normalization, so the
+        // message names the family instead of the dated snapshot.
+        assert!(error.contains("gpt-6.1-terra"));
+
+        assert!(!api_proxy_visible_models(&settings).contains(&"gpt-6.1-terra"));
+        assert!(
+            api_proxy_visible_models_for_key(&AppSettings::default(), &allowed_key)
+                .contains(&"gpt-6.1-terra")
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_use_gpt_6_lite_contract_and_keep_legacy_models() {
+        let request = json!({
+            "model": "gpt-6.1-terra",
+            "max_tokens": 128,
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        let (payload, _) = convert_anthropic_messages_request_to_codex(&request)
+            .expect("Anthropic request with GPT-6 model");
+        assert_eq!(payload["model"], "gpt-6.1-terra");
+        assert_eq!(payload["input"][0]["type"], "additional_tools");
+        assert_eq!(payload["reasoning"]["effort"], "xhigh");
+
+        let rejected = json!({
+            "model": "gpt-6.1-terra",
+            "reasoning_effort": "none",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        let error = convert_anthropic_messages_request_to_codex(&rejected)
+            .expect_err("GPT-6 none must be rejected through /v1/messages as well");
+        assert!(error.contains("推理强度"));
+
+        let legacy = json!({
+            "model": "gpt-5.5",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        let (payload, _) = convert_anthropic_messages_request_to_codex(&legacy)
+            .expect("legacy Anthropic model unaffected");
+        assert_eq!(payload["model"], "gpt-5.5");
+    }
+
+    // ---- PR5: Chat Completions stream termination ----
+
+    fn chat_sse(data: &str) -> SseEvent {
+        SseEvent {
+            event: None,
+            data: data.to_string(),
+        }
+    }
+
+    #[test]
+    fn chat_stream_latches_after_terminal_event() {
+        let mut state = ChatStreamState::default();
+        let created = chat_sse(
+            "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"model\":\"gpt-6-astra\"}}",
+        );
+        assert!(translate_sse_event_to_chat_chunk(&created, &mut state).is_empty());
+        let completed = chat_sse(
+            "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}",
+        );
+        let chunks = translate_sse_event_to_chat_chunk(&completed, &mut state);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "stop");
+        assert!(state.terminal_seen);
+        let late = chat_sse("{\"type\":\"response.output_text.delta\",\"delta\":\"late\"}");
+        assert!(translate_sse_event_to_chat_chunk(&late, &mut state).is_empty());
+    }
+
+    #[test]
+    fn chat_stream_incomplete_and_failed_map_to_terminal_chunks() {
+        let mut state = ChatStreamState::default();
+        let incomplete = chat_sse(
+            "{\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}",
+        );
+        let chunks = translate_sse_event_to_chat_chunk(&incomplete, &mut state);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "length");
+
+        let mut state = ChatStreamState::default();
+        let content_filter = chat_sse(
+            "{\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"}}}",
+        );
+        assert_eq!(
+            translate_sse_event_to_chat_chunk(&content_filter, &mut state)[0]["choices"][0]
+                ["finish_reason"],
+            "content_filter"
+        );
+
+        let mut state = ChatStreamState::default();
+        let failed = chat_sse(
+            "{\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"boom\"}}}",
+        );
+        let chunks = translate_sse_event_to_chat_chunk(&failed, &mut state);
+        assert_eq!(chunks[0]["error"]["message"], "boom");
+        assert!(chunks[0].get("choices").is_none());
+        assert!(state.terminal_seen && state.terminal_error_emitted);
+
+        let mut state = ChatStreamState::default();
+        let error_event = chat_sse("{\"type\":\"error\",\"error\":{\"message\":\"upstream bad\"}}");
+        assert_eq!(
+            translate_sse_event_to_chat_chunk(&error_event, &mut state)[0]["error"]["message"],
+            "upstream bad"
+        );
+    }
+
+    #[test]
+    fn chat_stream_completed_with_incomplete_status_maps_to_length() {
+        let mut state = ChatStreamState::default();
+        let event = chat_sse(
+            "{\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}",
+        );
+        assert_eq!(
+            translate_sse_event_to_chat_chunk(&event, &mut state)[0]["choices"][0]["finish_reason"],
+            "length"
+        );
+    }
+
+    #[test]
+    fn chat_stream_done_sentinel_marks_terminal_without_chunk() {
+        let mut state = ChatStreamState::default();
+        assert!(translate_sse_event_to_chat_chunk(&chat_sse("[DONE]"), &mut state).is_empty());
+        assert!(state.terminal_seen);
+    }
+
+    #[test]
+    fn chat_stream_tool_calls_finish_reason_preserved() {
+        let mut state = ChatStreamState::default();
+        state.function_call_index = 0;
+        let event =
+            chat_sse("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}");
+        assert_eq!(
+            translate_sse_event_to_chat_chunk(&event, &mut state)[0]["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
+    }
+
+    fn chat_stream_upstream(chunks: Vec<&str>) -> CodexUpstreamResponse {
+        let items: Vec<Result<axum::body::Bytes, String>> = chunks
+            .into_iter()
+            .map(|chunk| Ok(axum::body::Bytes::from(chunk.to_string())))
+            .collect();
+        CodexUpstreamResponse::WebSocket {
+            headers: HeaderMap::new(),
+            stream: Box::pin(futures_util::stream::iter(items)),
+        }
+    }
+
+    fn chat_stream_test_storage() -> ProxyStorageContext {
+        let dir = std::env::temp_dir().join(format!("ctc-pr3-chat-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp data dir");
+        new_proxy_storage_context(
+            dir,
+            Arc::new(tokio::sync::Mutex::new(())),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+        )
+    }
+
+    fn chat_stream_test_metadata() -> ApiProxyUsageMetadata {
+        ApiProxyUsageMetadata {
+            key_id: None,
+            key_label: None,
+            model: "gpt-6-astra".to_string(),
+            route: "/v1/chat/completions".to_string(),
+            reasoning_effort: None,
+            service_tier: None,
+        }
+    }
+
+    async fn collect_chat_stream_body(response: axum::http::Response<axum::body::Body>) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+            .await
+            .expect("collect chat stream body");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn chat_stream_builder_normal_completion_has_one_finish_and_one_done() {
+        let body = collect_chat_stream_body(build_chat_streaming_response(
+            chat_stream_upstream(vec![concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"model\":\"gpt-6-astra\"}}\n\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            )]),
+            chat_stream_test_storage(),
+            chat_stream_test_metadata(),
+        ))
+        .await;
+        assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
+        assert_eq!(
+            body.matches("\"finish_reason\":\"stop\"").count(),
+            1,
+            "{body}"
+        );
+        assert!(!body.contains("\"error\""), "{body}");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_builder_failed_stream_emits_error_and_single_done() {
+        let body = collect_chat_stream_body(build_chat_streaming_response(
+            chat_stream_upstream(vec![concat!(
+                "event: response.failed\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"upstream boom\"}}}\n\n",
+            )]),
+            chat_stream_test_storage(),
+            chat_stream_test_metadata(),
+        ))
+        .await;
+        assert!(body.contains("upstream boom"), "{body}");
+        assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
+        assert!(!body.contains("\"finish_reason\""), "{body}");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_builder_unterminated_stream_emits_error_and_single_done() {
+        let body = collect_chat_stream_body(build_chat_streaming_response(
+            chat_stream_upstream(vec![concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"model\":\"gpt-6-astra\"}}\n\n",
+            )]),
+            chat_stream_test_storage(),
+            chat_stream_test_metadata(),
+        ))
+        .await;
+        assert!(body.contains("上游流在终态事件前结束"), "{body}");
+        assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
     }
 }
