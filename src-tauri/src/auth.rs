@@ -637,6 +637,41 @@ pub(crate) fn current_auth_variant_key() -> Option<String> {
         .and_then(|auth_json| auth_variant_key(&auth_json))
 }
 
+/// candidate 是否是比 reference 更新的一次授权轮换快照。
+///
+/// 判定顺序（与上游 v3.1.3 一致）：
+/// 1. candidate 的 refresh_token 必须非空且与 reference 不同；
+/// 2. 双方都有 last_refresh 时要求 candidate >= reference；
+/// 3. candidate 有 last_refresh、reference 没有 → true；
+/// 4. 其它（candidate 无时间戳 / 解析失败）→ false。
+pub(crate) fn has_newer_auth_refresh_snapshot(candidate: &Value, reference: &Value) -> bool {
+    let candidate_refresh_token = auth_token_object(candidate)
+        .and_then(|tokens| tokens.get("refresh_token"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let reference_refresh_token = auth_token_object(reference)
+        .and_then(|tokens| tokens.get("refresh_token"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if candidate_refresh_token.is_none() || candidate_refresh_token == reference_refresh_token {
+        return false;
+    }
+
+    match (
+        auth_last_refresh_unix_seconds(candidate),
+        auth_last_refresh_unix_seconds(reference),
+    ) {
+        (Some(candidate_refreshed_at), Some(reference_refreshed_at)) => {
+            candidate_refreshed_at >= reference_refreshed_at
+        }
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 /// Emits a redacted startup diagnostic for the current Codex auth file.
 ///
 /// This is deliberately compiled only for debug builds. It reports parser stages and
@@ -1702,5 +1737,70 @@ mod tests {
                 .and_then(Value::as_str),
             Some(account_id)
         );
+    }
+
+    fn snapshot(refresh_token: &str, last_refresh: Option<&str>) -> Value {
+        let mut value = json!({ "tokens": { "refresh_token": refresh_token } });
+        if let Some(last_refresh) = last_refresh {
+            value["last_refresh"] = Value::String(last_refresh.to_string());
+        }
+        value
+    }
+
+    #[test]
+    fn has_newer_auth_refresh_snapshot_requires_a_rotated_token() {
+        let reference = snapshot("token-a", Some("2026-08-20T10:48:37Z"));
+
+        // 同 token（即使时间更新）不算更新快照。
+        assert!(!has_newer_auth_refresh_snapshot(
+            &snapshot("token-a", Some("2026-08-20T11:00:00Z")),
+            &reference
+        ));
+        // 空白 token 不算。
+        assert!(!has_newer_auth_refresh_snapshot(
+            &snapshot("  ", Some("2026-08-20T11:00:00Z")),
+            &reference
+        ));
+        // tokens 缺失不算。
+        assert!(!has_newer_auth_refresh_snapshot(&json!({}), &reference));
+    }
+
+    #[test]
+    fn has_newer_auth_refresh_snapshot_compares_last_refresh() {
+        let reference = snapshot("token-a", Some("2026-08-20T10:48:37Z"));
+
+        assert!(has_newer_auth_refresh_snapshot(
+            &snapshot("token-b", Some("2026-08-20T10:52:06Z")),
+            &reference
+        ));
+        // 同一秒也算“不旧”。
+        assert!(has_newer_auth_refresh_snapshot(
+            &snapshot("token-b", Some("2026-08-20T10:48:37Z")),
+            &reference
+        ));
+        // 更旧 → false。
+        assert!(!has_newer_auth_refresh_snapshot(
+            &snapshot("token-b", Some("2026-08-20T10:40:00Z")),
+            &reference
+        ));
+    }
+
+    #[test]
+    fn has_newer_auth_refresh_snapshot_handles_missing_and_invalid_timestamps() {
+        // reference 无时间戳 → candidate 有时间戳即视为更新。
+        assert!(has_newer_auth_refresh_snapshot(
+            &snapshot("token-b", Some("2026-08-20T10:52:06Z")),
+            &snapshot("token-a", None)
+        ));
+        // 双方都无时间戳 → false（有意行为，避免无依据地改判）。
+        assert!(!has_newer_auth_refresh_snapshot(
+            &snapshot("token-b", None),
+            &snapshot("token-a", None)
+        ));
+        // 非 RFC3339 的数值时间 → 解析失败 → false。
+        assert!(!has_newer_auth_refresh_snapshot(
+            &snapshot("token-b", Some("1787000000")),
+            &snapshot("token-a", Some("2026-08-20T10:48:37Z"))
+        ));
     }
 }

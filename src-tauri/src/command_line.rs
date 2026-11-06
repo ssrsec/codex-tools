@@ -542,44 +542,72 @@ async fn switch_account(
     let refresh_lock = Arc::new(Mutex::new(()));
 
     {
-        let account = store
+        let target_id = store
             .accounts
-            .get_mut(selected_index)
-            .ok_or_else(|| "找不到要切换的账号".to_string())?;
+            .get(selected_index)
+            .ok_or_else(|| "找不到要切换的账号".to_string())?
+            .id
+            .clone();
 
-        if matches!(account.source_kind, AccountSourceKind::Chatgpt)
-            && auth::auth_tokens_need_refresh(&account.auth_json)
+        // 先处理目标账号的 token 刷新（只借用目标账号）。
         {
-            if account.auth_refresh_blocked {
-                return Err(format!(
-                    "切换账号前刷新登录令牌失败: {}",
-                    account
-                        .auth_refresh_error
-                        .clone()
-                        .unwrap_or_else(|| "工具保存的授权快照已失效，请重新登录授权。".to_string())
-                ));
-            }
+            let account = store
+                .accounts
+                .get_mut(selected_index)
+                .ok_or_else(|| "找不到要切换的账号".to_string())?;
 
-            match auth::refresh_chatgpt_auth_tokens_serialized(&account.auth_json, &refresh_lock)
-                .await
+            if matches!(account.source_kind, AccountSourceKind::Chatgpt)
+                && auth::auth_tokens_need_refresh(&account.auth_json)
             {
-                Ok(refreshed) => {
-                    account.auth_json = refreshed;
-                    account.auth_refresh_blocked = false;
-                    account.auth_refresh_error = None;
-                    account.updated_at = utils::now_unix_seconds();
-                }
-                Err(error) => {
+                if account.auth_refresh_blocked {
                     return Err(format!(
                         "切换账号前刷新登录令牌失败: {}",
-                        normalize_cli_usage_error(&error)
+                        account.auth_refresh_error.clone().unwrap_or_else(|| {
+                            "工具保存的授权快照已失效，请重新登录授权。".to_string()
+                        })
                     ));
+                }
+
+                match auth::refresh_chatgpt_auth_tokens_serialized(
+                    &account.auth_json,
+                    &refresh_lock,
+                )
+                .await
+                {
+                    Ok(refreshed) => {
+                        account.auth_json = refreshed;
+                        account.auth_refresh_blocked = false;
+                        account.auth_refresh_error = None;
+                        account.updated_at = utils::now_unix_seconds();
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "切换账号前刷新登录令牌失败: {}",
+                            normalize_cli_usage_error(&error)
+                        ));
+                    }
                 }
             }
         }
 
         // 与 GUI 切换保持一致：先让桌面端退出，再改写 ~/.codex，避免应用在运行中被换身份。
         crate::stop_desktop_app_if_running()?;
+        // 与 GUI 一致：改写 auth.json 之前把当前账号在桌面端轮换后的授权快照写回 profile。
+        // 本函数末尾会统一 save_store_to_path，因此这里的变更不需要额外落盘。
+        if store
+            .settings
+            .active_account_id
+            .clone()
+            .is_some_and(|active_id| active_id != target_id)
+        {
+            let _ = crate::account_service::capture_current_auth_for_active_profile(
+                store_path, &mut store,
+            );
+        }
+        let account = store
+            .accounts
+            .get_mut(selected_index)
+            .ok_or_else(|| "找不到要切换的账号".to_string())?;
         // 备份项目状态，并把当前项目清单合并进目标账号快照（只合并、不删除）。
         if let Some(prepared) = crate::desktop_state::prepare_project_state(
             &app_paths::app_data_dir_without_tauri()?,

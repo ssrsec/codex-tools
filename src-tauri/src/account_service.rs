@@ -21,6 +21,7 @@ use crate::auth::auth_tokens_need_keepalive_refresh;
 use crate::auth::current_auth_account_key;
 use crate::auth::current_auth_variant_key;
 use crate::auth::extract_auth;
+use crate::auth::has_newer_auth_refresh_snapshot;
 #[cfg(debug_assertions)]
 use crate::auth::log_current_auth_parse_diagnostic;
 use crate::auth::normalize_imported_auth_json;
@@ -1045,32 +1046,94 @@ async fn latest_account_auth_json(
 
     let _guard = state.store_lock.lock().await;
     let store = load_store(app).ok()?;
-    let store_auth_json = store
+    let matching_accounts = store
         .accounts
-        .into_iter()
+        .iter()
         .filter(|account| {
             !matches!(account.source_kind, AccountSourceKind::Relay)
                 && account.account_key() == account_key
         })
+        .collect::<Vec<_>>();
+    let store_auth_json = matching_accounts
+        .iter()
         .max_by(|left, right| {
             (!left.auth_refresh_blocked)
                 .cmp(&(!right.auth_refresh_blocked))
                 .then(left.updated_at.cmp(&right.updated_at))
         })
-        .map(|account| account.auth_json);
+        .map(|account| account.auth_json.clone());
+    // P0-3：profile auth.json 是第三来源。capture 在 save_store 之前就写了 profile，
+    // 若 save_store 失败，下一次刷新仍能从 profile 取到轮换后的 token，避免误判 blocked。
+    let profile_auth_jsons = read_profile_auth_snapshots(&matching_accounts, account_key);
 
-    // 在同一把 auth 锁内优先采用与任务输入不同的持久化快照，避免当前 auth 文件较旧时覆盖新导入的 store 快照。
+    select_latest_auth_snapshot(
+        reference_auth_json,
+        store_auth_json,
+        current_auth_json,
+        profile_auth_jsons,
+    )
+}
+
+/// 读取同 account_key 账号 profile 里的授权快照（第三来源）。
+fn read_profile_auth_snapshots(
+    accounts: &[&StoredAccount],
+    account_key: &str,
+) -> Vec<serde_json::Value> {
+    let mut snapshots = Vec::new();
+    for account in accounts {
+        let Some(path) = account.profile_auth_path.as_deref() else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if auth_json_account_key(&value).as_deref() == Some(account_key) {
+            snapshots.push(value);
+        }
+    }
+    snapshots
+}
+
+/// 在 store / live auth / profile auth 三个来源中选“与 reference 不同且最新”的快照。
+///
+/// 无任何时间戳时保持原有优先级（store → live → profile），避免行为漂移。
+fn select_latest_auth_snapshot(
+    reference_auth_json: &serde_json::Value,
+    store_auth_json: Option<serde_json::Value>,
+    current_auth_json: Option<serde_json::Value>,
+    profile_auth_jsons: Vec<serde_json::Value>,
+) -> Option<serde_json::Value> {
     let reference_refresh_token = auth_json_refresh_token(reference_auth_json);
-    let store_refresh_token = store_auth_json.as_ref().and_then(auth_json_refresh_token);
-    if store_refresh_token.is_some() && store_refresh_token != reference_refresh_token {
-        return store_auth_json;
-    }
-    let current_refresh_token = current_auth_json.as_ref().and_then(auth_json_refresh_token);
-    if current_refresh_token.is_some() && current_refresh_token != reference_refresh_token {
-        return current_auth_json;
+    let mut candidates = Vec::new();
+    for candidate in store_auth_json
+        .clone()
+        .into_iter()
+        .chain(current_auth_json.clone())
+        .chain(profile_auth_jsons)
+    {
+        let token = auth_json_refresh_token(&candidate);
+        if token.is_some() && token != reference_refresh_token {
+            candidates.push(candidate);
+        }
     }
 
-    current_auth_json.or(store_auth_json)
+    if candidates.is_empty() {
+        return current_auth_json.or(store_auth_json);
+    }
+    let has_timestamp = candidates
+        .iter()
+        .any(|candidate| auth_last_refresh_unix_seconds(candidate).is_some());
+    if !has_timestamp {
+        return candidates.into_iter().next();
+    }
+    candidates.into_iter().max_by(|left, right| {
+        auth_last_refresh_unix_seconds(left)
+            .unwrap_or(i64::MIN)
+            .cmp(&auth_last_refresh_unix_seconds(right).unwrap_or(i64::MIN))
+    })
 }
 
 pub(crate) async fn refresh_latest_auth_json_if_newer(
@@ -1083,9 +1146,7 @@ pub(crate) async fn refresh_latest_auth_json_if_newer(
         return auth_json.clone();
     };
 
-    let current_refresh_token = auth_json_refresh_token(auth_json);
-    let latest_refresh_token = auth_json_refresh_token(&latest);
-    if latest_refresh_token.is_some() && latest_refresh_token != current_refresh_token {
+    if has_newer_auth_refresh_snapshot(&latest, auth_json) {
         log::info!("刷新前检测到账号已有更新后的授权快照，改用最新快照 account_key={account_key}");
         return latest;
     }
@@ -1113,9 +1174,7 @@ pub(crate) async fn recover_refresh_failure_from_latest_snapshot(
     }
 
     let latest = latest_account_auth_json(app, state, account_key, attempted_auth_json).await?;
-    let attempted_refresh_token = auth_json_refresh_token(attempted_auth_json);
-    let latest_refresh_token = auth_json_refresh_token(&latest);
-    if latest_refresh_token.is_some() && latest_refresh_token != attempted_refresh_token {
+    if has_newer_auth_refresh_snapshot(&latest, attempted_auth_json) {
         log::warn!(
             "刷新失败后检测到本地已有更新后的授权快照，使用最新快照恢复 account_key={account_key}"
         );
@@ -1123,6 +1182,82 @@ pub(crate) async fn recover_refresh_failure_from_latest_snapshot(
     }
 
     None
+}
+
+/// 切换前是否需要把 live auth.json 的轮换快照写回“正在使用”的账号。
+pub(crate) fn should_capture_current_auth_for_active_profile(
+    active_account: &StoredAccount,
+    current_account_key: &str,
+    current_auth: &serde_json::Value,
+) -> bool {
+    !matches!(active_account.source_kind, AccountSourceKind::Relay)
+        && active_account.account_key() == current_account_key
+        && has_newer_auth_refresh_snapshot(current_auth, &active_account.auth_json)
+}
+
+/// 把当前 ~/.codex/auth.json 里由桌面端轮换后的授权快照写回活动账号 profile。
+///
+/// 读不到/身份不符/不是更新快照 → 返回 false；profile 同步失败只告警。
+/// 本函数不落盘 store（调用方持有 store 锁并统一 save_store）。
+pub(crate) fn capture_current_auth_for_active_profile(
+    store_path: &Path,
+    store: &mut AccountsStore,
+) -> bool {
+    let current_auth = match read_current_codex_auth_optional() {
+        Ok(Some(auth_json)) => auth_json,
+        Ok(None) => {
+            log::warn!("切换前未找到当前 Codex 授权快照，跳过保存");
+            return false;
+        }
+        Err(error) => {
+            log::warn!("读取当前 Codex 授权快照失败，跳过保存: {error}");
+            return false;
+        }
+    };
+    capture_current_auth_snapshot(store_path, store, &current_auth)
+}
+
+/// 捕获逻辑的可注入版本（单测用，不读真实 ~/.codex/auth.json）。
+pub(crate) fn capture_current_auth_snapshot(
+    store_path: &Path,
+    store: &mut AccountsStore,
+    current_auth: &serde_json::Value,
+) -> bool {
+    let Some(current_account_key) = auth_json_account_key(current_auth) else {
+        return false;
+    };
+    let Some(active_id) = store.settings.active_account_id.clone() else {
+        return false;
+    };
+    let Some(active_account) = store
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == active_id)
+    else {
+        return false;
+    };
+    if !should_capture_current_auth_for_active_profile(
+        active_account,
+        &current_account_key,
+        current_auth,
+    ) {
+        return false;
+    }
+
+    active_account.auth_json = current_auth.clone();
+    active_account.updated_at = now_unix_seconds();
+    active_account.auth_refresh_blocked = false;
+    active_account.auth_refresh_error = None;
+    if let Err(error) =
+        profile_files::sync_account_profile_in_store_path(store_path, active_account)
+    {
+        log::warn!("保存当前账号 profile 授权快照失败（不阻断切换）: {error}");
+    }
+    log::info!(
+        "切换前已保存当前账号由桌面端轮换后的授权快照 account_id={}",
+        active_account.id
+    );
+    true
 }
 
 struct AuthOperationRefreshSuccess {
@@ -2165,6 +2300,7 @@ fn normalize_import_source(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::account_is_definitely_unusable;
+    use super::capture_current_auth_snapshot;
     use super::expand_import_json_content;
     use super::is_stale_refresh_snapshot_error;
     use super::keepalive_max_last_refresh_age_secs;
@@ -2172,6 +2308,8 @@ mod tests {
     use super::normalize_usage_error_message;
     use super::refresh_usage_worker_count_from_resources;
     use super::resolve_usage_first_plan_type;
+    use super::select_latest_auth_snapshot;
+    use super::should_capture_current_auth_for_active_profile;
     use super::should_refresh_membership_auth;
     use super::should_retry_with_token_refresh;
     use super::should_suspend_auth_keepalive;
@@ -2705,7 +2843,6 @@ mod tests {
         assert!(should_retry_with_token_refresh(&fetch_result));
     }
 
-
     fn cleanup_account(
         plan_type: Option<&str>,
         usage_plan: Option<&str>,
@@ -2784,7 +2921,6 @@ mod tests {
         assert!(should_retry_with_token_refresh(&unauthorized));
     }
 
-
     #[test]
     fn membership_refresh_ignores_plan_case_and_whitespace() {
         let now = 2_000_000_000;
@@ -2815,5 +2951,189 @@ mod tests {
             Some("pro"),
             now
         ));
+    }
+
+    fn stored_account_fixture(
+        id: &str,
+        principal_id: &str,
+        account_id: &str,
+        auth_json: serde_json::Value,
+    ) -> StoredAccount {
+        serde_json::from_value(json!({
+            "id": id,
+            "label": id,
+            "sourceKind": "chatgpt",
+            "principalId": principal_id,
+            "email": null,
+            "accountId": account_id,
+            "planType": null,
+            "authJson": auth_json,
+            "addedAt": 1,
+            "updatedAt": 1,
+            "usage": null,
+            "usageError": null,
+        }))
+        .expect("stored account fixture should parse")
+    }
+
+    fn refresh_snapshot(token: &str, last_refresh: Option<&str>) -> serde_json::Value {
+        let mut value = json!({ "tokens": { "refresh_token": token } });
+        if let Some(last_refresh) = last_refresh {
+            value["last_refresh"] = json!(last_refresh);
+        }
+        value
+    }
+
+    #[test]
+    fn capture_decision_requires_same_identity_and_a_newer_snapshot() {
+        let reference = refresh_snapshot("token-old", Some("2026-08-20T10:48:37Z"));
+        let account = stored_account_fixture("acc-1", "p", "account-1", reference.clone());
+        let account_key = account.account_key();
+        let newer = refresh_snapshot("token-new", Some("2026-08-20T10:52:06Z"));
+        let older = refresh_snapshot("token-new", Some("2026-08-20T10:40:00Z"));
+
+        assert!(should_capture_current_auth_for_active_profile(
+            &account,
+            &account_key,
+            &newer
+        ));
+        assert!(!should_capture_current_auth_for_active_profile(
+            &account,
+            "other|account-2",
+            &newer
+        ));
+        assert!(!should_capture_current_auth_for_active_profile(
+            &account,
+            &account_key,
+            &older
+        ));
+
+        let mut relay = account.clone();
+        relay.source_kind = crate::models::AccountSourceKind::Relay;
+        assert!(!should_capture_current_auth_for_active_profile(
+            &relay,
+            &account_key,
+            &newer
+        ));
+    }
+
+    #[test]
+    fn capture_snapshot_updates_active_account_without_saving_store() {
+        let store_path =
+            std::env::temp_dir().join(format!("codex-tools-capture-test-{}", uuid::Uuid::new_v4()));
+        let id_token = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(
+                json!({
+                    "email": "p@example.com",
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "account-1",
+                        "chatgpt_plan_type": "pro"
+                    }
+                })
+                .to_string()
+            )
+        );
+        let mut store = AccountsStore::default();
+        let reference = refresh_snapshot("token-old", Some("2026-08-20T10:48:37Z"));
+        let mut account = stored_account_fixture("acc-1", "p@example.com", "account-1", reference);
+        account.auth_refresh_blocked = true;
+        account.auth_refresh_error = Some("stale".to_string());
+        store.accounts.push(account);
+        store.settings.active_account_id = Some("acc-1".to_string());
+
+        let current_auth = json!({
+            "tokens": {
+                "access_token": "access",
+                "id_token": id_token,
+                "refresh_token": "token-new"
+            },
+            "last_refresh": "2026-08-20T10:52:06Z"
+        });
+
+        assert!(capture_current_auth_snapshot(
+            &store_path,
+            &mut store,
+            &current_auth
+        ));
+        let active = store
+            .accounts
+            .iter()
+            .find(|account| account.id == "acc-1")
+            .expect("active account");
+        assert_eq!(
+            active
+                .auth_json
+                .pointer("/tokens/refresh_token")
+                .and_then(serde_json::Value::as_str),
+            Some("token-new")
+        );
+        assert!(!active.auth_refresh_blocked);
+        assert!(active.auth_refresh_error.is_none());
+        assert!(active.profile_auth_path.is_some());
+
+        // 同账号再捕获一次：token 未变 → 不重复更新。
+        let updated_at = active.updated_at;
+        assert!(!capture_current_auth_snapshot(
+            &store_path,
+            &mut store,
+            &current_auth
+        ));
+        assert_eq!(
+            store
+                .accounts
+                .iter()
+                .find(|account| account.id == "acc-1")
+                .expect("active account")
+                .updated_at,
+            updated_at
+        );
+
+        let _ = std::fs::remove_dir_all(&store_path);
+    }
+
+    #[test]
+    fn latest_snapshot_prefers_newest_profile_snapshot() {
+        let reference = refresh_snapshot("token-old", Some("2026-08-20T10:00:00Z"));
+        let store_auth = refresh_snapshot("token-store", Some("2026-08-20T10:10:00Z"));
+        let profile_auth = refresh_snapshot("token-profile", Some("2026-08-20T10:30:00Z"));
+
+        let selected =
+            select_latest_auth_snapshot(&reference, Some(store_auth), None, vec![profile_auth])
+                .expect("should select a snapshot");
+        assert_eq!(
+            selected
+                .pointer("/tokens/refresh_token")
+                .and_then(serde_json::Value::as_str),
+            Some("token-profile")
+        );
+    }
+
+    #[test]
+    fn latest_snapshot_keeps_store_priority_without_timestamps() {
+        let reference = refresh_snapshot("token-old", None);
+        let store_auth = refresh_snapshot("token-store", None);
+        let profile_auth = refresh_snapshot("token-profile", None);
+
+        let selected =
+            select_latest_auth_snapshot(&reference, Some(store_auth), None, vec![profile_auth])
+                .expect("should select a snapshot");
+        assert_eq!(
+            selected
+                .pointer("/tokens/refresh_token")
+                .and_then(serde_json::Value::as_str),
+            Some("token-store")
+        );
+
+        // 与 reference 同 token 的快照不参与"更新"竞争，回退到原有 current.or(store) 语义。
+        let same = refresh_snapshot("token-old", Some("2026-08-20T11:00:00Z"));
+        let fallback = select_latest_auth_snapshot(&reference, Some(same), None, vec![])
+            .expect("fallback snapshot");
+        assert_eq!(
+            fallback
+                .pointer("/tokens/refresh_token")
+                .and_then(serde_json::Value::as_str),
+            Some("token-old")
+        );
     }
 }
