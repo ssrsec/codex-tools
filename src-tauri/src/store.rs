@@ -729,6 +729,10 @@ mod tests {
                 window_seconds: 604_800,
                 reset_at: Some(40),
             }),
+            windows: Vec::new(),
+            allowed: None,
+            limit_reached: None,
+            rate_limit_reached_type: None,
             credits: None,
             reset_credits: None,
         }

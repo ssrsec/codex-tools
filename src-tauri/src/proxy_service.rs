@@ -79,7 +79,6 @@ use crate::models::CreateApiProxyKeyInput;
 use crate::models::StoredAccount;
 use crate::models::UpdateApiProxyKeyInput;
 use crate::models::UsageSnapshot;
-use crate::models::UsageWindow;
 use crate::models::DEFAULT_API_PROXY_MODEL;
 use crate::models::DEFAULT_API_PROXY_REASONING_EFFORT;
 use crate::models::DEFAULT_API_PROXY_SERVICE_TIER;
@@ -4044,23 +4043,7 @@ fn retry_after_unix_seconds(headers: &HeaderMap, now: i64) -> Option<i64> {
 }
 
 fn quota_cooldown_until(candidate: &ProxyCandidate, now: i64) -> Option<i64> {
-    let usage = candidate.usage.as_ref()?;
-    usage
-        .one_week
-        .as_ref()
-        .into_iter()
-        .filter(|window| {
-            finite_used_percent(window).is_some_and(|used_percent| used_percent >= 100.0)
-        })
-        .map(|window| {
-            window.reset_at.unwrap_or_else(|| {
-                usage
-                    .fetched_at
-                    .saturating_add(window.window_seconds.max(0))
-            })
-        })
-        .filter(|reset_at| *reset_at > now)
-        .max()
+    crate::models::usage_exhaustion_reset_at(candidate.usage.as_ref(), now)
 }
 
 async fn send_codex_request_over_candidates(
@@ -4885,9 +4868,12 @@ fn sequential_switch_rank(candidate: &ProxyCandidate, current_key: &str, limit_p
 }
 
 fn is_under_sequential_limit(candidate: &ProxyCandidate, limit_percent: f64) -> bool {
-    active_window_used_percent(candidate)
-        .map(|used_percent| used_percent < limit_percent)
-        .unwrap_or(true)
+    crate::models::usage_most_constrained_used_percent(
+        candidate.usage.as_ref(),
+        now_unix_seconds(),
+    )
+    .map(|used_percent| used_percent < limit_percent)
+    .unwrap_or(true)
 }
 
 fn compare_proxy_candidates(left: &ProxyCandidate, right: &ProxyCandidate) -> Ordering {
@@ -4903,17 +4889,7 @@ fn compare_proxy_candidates(left: &ProxyCandidate, right: &ProxyCandidate) -> Or
         ordering => return ordering,
     }
 
-    match usage_window_used_percent(
-        left.usage
-            .as_ref()
-            .and_then(|usage| usage.one_week.as_ref()),
-    )
-    .total_cmp(&usage_window_used_percent(
-        right
-            .usage
-            .as_ref()
-            .and_then(|usage| usage.one_week.as_ref()),
-    )) {
+    match constrained_used_percent(left).total_cmp(&constrained_used_percent(right)) {
         Ordering::Equal => {}
         ordering => return ordering,
     }
@@ -4923,26 +4899,12 @@ fn compare_proxy_candidates(left: &ProxyCandidate, right: &ProxyCandidate) -> Or
         .then_with(|| left.account_key.cmp(&right.account_key))
 }
 
-fn active_window_used_percent(candidate: &ProxyCandidate) -> Option<f64> {
-    candidate
-        .usage
-        .as_ref()
-        .and_then(|usage| usage.one_week.as_ref())
-        .and_then(finite_used_percent)
-}
-
-fn usage_window_used_percent(window: Option<&UsageWindow>) -> f64 {
-    window
-        .and_then(finite_used_percent)
-        .unwrap_or(f64::INFINITY)
-}
-
-fn finite_used_percent(window: &UsageWindow) -> Option<f64> {
-    if window.used_percent.is_finite() {
-        Some(window.used_percent.clamp(0.0, 100.0))
-    } else {
-        None
-    }
+fn constrained_used_percent(candidate: &ProxyCandidate) -> f64 {
+    crate::models::usage_most_constrained_used_percent(
+        candidate.usage.as_ref(),
+        now_unix_seconds(),
+    )
+    .unwrap_or(f64::INFINITY)
 }
 
 async fn refresh_proxy_candidate_auth(
@@ -7937,6 +7899,10 @@ mod tests {
                     window_seconds: 604_800,
                     reset_at: None,
                 }),
+                windows: Vec::new(),
+                allowed: None,
+                limit_reached: None,
+                rate_limit_reached_type: None,
                 credits: None,
                 reset_credits: None,
             }),
@@ -8090,6 +8056,10 @@ mod tests {
                 window_seconds: 604_800,
                 reset_at: Some(200),
             }),
+            windows: Vec::new(),
+            allowed: None,
+            limit_reached: None,
+            rate_limit_reached_type: None,
             credits: None,
             reset_credits: None,
         };
@@ -8545,8 +8515,8 @@ mod tests {
             candidate_labels(&ordered),
             vec![
                 "weekly 10 five 5",
-                "weekly 10 five 90",
                 "weekly 20",
+                "weekly 10 five 90",
                 "free weekly 95",
                 "blocked low usage",
             ]
@@ -8568,13 +8538,13 @@ mod tests {
     }
 
     #[test]
-    fn quota_cooldown_uses_the_active_quota_window_reset() {
+    fn quota_cooldown_uses_the_latest_blocking_window_reset() {
         let mut candidate = proxy_candidate("quota", "account-a", Some(100.0), Some(100.0), false);
         let usage = candidate.usage.as_mut().expect("usage");
         usage.one_week.as_mut().expect("one week").reset_at = Some(300);
-        usage.five_hour.as_mut().expect("legacy five hour").reset_at = Some(400);
+        usage.five_hour.as_mut().expect("five hour").reset_at = Some(400);
 
-        assert_eq!(super::quota_cooldown_until(&candidate, 100), Some(300));
+        assert_eq!(super::quota_cooldown_until(&candidate, 100), Some(400));
     }
 
     #[test]

@@ -586,10 +586,7 @@ pub(crate) fn current_auth_account_key() -> Option<String> {
 }
 
 pub(crate) fn normalize_plan_type_key(plan_type: Option<&str>) -> String {
-    let Some(value) = plan_type.map(str::trim).filter(|value| !value.is_empty()) else {
-        return "unknown".to_string();
-    };
-    value.to_ascii_lowercase()
+    crate::models::normalize_plan_slug(plan_type.unwrap_or_default())
 }
 
 pub(crate) fn chatgpt_subscription_active_until(auth_json: &Value) -> Option<i64> {

@@ -34,8 +34,8 @@ const SESSION_EXPORT_LIMIT: usize = 500;
 const TOKEN_USAGE_TAIL_SIGNATURE_BYTES: u64 = 128;
 const FORK_MATCH_RESYNC_WINDOW: usize = 32;
 const FORK_MATCH_ANCHOR_RECORDS: usize = 4;
-const PRICING_SOURCE: &str = "OpenAI API standard short-context text-token pricing per 1M; excludes service-tier, long-context, cache-write, and tool fees; checked 2026-07-26";
-const COST_ANALYTICS_CACHE_VERSION: u8 = 10;
+const PRICING_SOURCE: &str = "OpenAI API standard short-context text-token pricing per 1M; excludes service-tier, long-context, cache-write, and tool fees; checked 2026-11-06";
+const COST_ANALYTICS_CACHE_VERSION: u8 = 11;
 const COST_SOURCE_LOCAL: &str = "local_estimate";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -91,6 +91,12 @@ pub(crate) struct CodexCostAnalyticsSnapshot {
     #[serde(default)]
     pub(crate) excluded_agent_session_count: usize,
     pub(crate) event_count: usize,
+    /// 截断前的主会话总数（UI 显示“显示前 500 / 共 N”）。
+    #[serde(default)]
+    pub(crate) session_total: usize,
+    /// 费率表未覆盖的模型名（成本仍按通用兜底费率估算，仅用于 UI 提示“估算”）。
+    #[serde(default)]
+    pub(crate) pricing_unknown_models: Vec<String>,
     pub(crate) total: CodexTokenTotals,
     pub(crate) total_cost_usd: f64,
     #[serde(default)]
@@ -896,6 +902,7 @@ where
     let mut total_cost_usd = 0.0;
     let mut last_7d = CodexTokenTotals::default();
     let mut last_7d_cost_usd = 0.0;
+    let mut pricing_unknown_models = HashSet::<String>::new();
 
     for parsed in parsed_files {
         let ParsedAnalyticsSessionFile {
@@ -904,6 +911,10 @@ where
             prompt_keys,
             ..
         } = parsed;
+        let session_model = session.model.trim();
+        if !session_model.is_empty() && pricing_rate_for_model_known(session_model).is_none() {
+            pricing_unknown_models.insert(session_model.to_string());
+        }
         let project_entry = projects
             .entry(session.project_path.clone())
             .or_insert_with(|| ProjectAccumulator::new(&session.project_path));
@@ -920,6 +931,10 @@ where
 
         for event in events {
             event_count += 1;
+            let event_model = event.model.trim();
+            if !event_model.is_empty() && pricing_rate_for_model_known(event_model).is_none() {
+                pricing_unknown_models.insert(event_model.to_string());
+            }
             if last_7d_date_range
                 .and_then(|(start, end)| {
                     local_date_at(event.timestamp).map(|date| date >= start && date <= end)
@@ -981,6 +996,11 @@ where
     });
     top_prompts.truncate(TOP_EXPENSIVE_PROMPT_LIMIT);
 
+    let mut pricing_unknown_models = pricing_unknown_models.into_iter().collect::<Vec<_>>();
+    pricing_unknown_models.sort();
+
+    let (session_total, sessions) = truncate_sessions(sessions);
+
     let snapshot = CodexCostAnalyticsSnapshot {
         updated_at: now,
         pricing_source: PRICING_SOURCE.to_string(),
@@ -990,6 +1010,8 @@ where
         unresolved_usage_event_count,
         excluded_agent_session_count,
         event_count,
+        session_total,
+        pricing_unknown_models,
         total,
         total_cost_usd: round_cost(total_cost_usd),
         local_total_cost_usd: round_cost(total_cost_usd),
@@ -1000,7 +1022,7 @@ where
         cost_source_updated_at: Some(now),
         cost_source_error: None,
         projects: project_breakdowns,
-        sessions: sessions.into_iter().take(SESSION_EXPORT_LIMIT).collect(),
+        sessions,
         heatmap: heatmap.into_values().collect(),
         top_prompts,
     };
@@ -2312,7 +2334,53 @@ fn estimate_token_cost_usd(model: &str, usage: &CodexTokenTotals) -> f64 {
 }
 
 fn pricing_rate_for_model(model: &str) -> PricingRate {
+    pricing_rate_for_model_known(model).unwrap_or(PricingRate {
+        input_per_million: 1.25,
+        cached_input_per_million: 0.125,
+        output_per_million: 10.0,
+    })
+}
+
+/// 返回费率表中明确覆盖的模型费率；未覆盖模型返回 None（调用方仍使用通用兜底费率）。
+fn pricing_rate_for_model_known(model: &str) -> Option<PricingRate> {
     let normalized = model.to_ascii_lowercase();
+    if normalized.starts_with("gpt-6.1-sol")
+        || normalized.starts_with("gpt6.1-sol")
+        || normalized.starts_with("gpt-6-1-sol")
+    {
+        return Some(PricingRate {
+            input_per_million: 2.0,
+            cached_input_per_million: 0.1,
+            output_per_million: 10.0,
+        });
+    }
+    if normalized.starts_with("gpt-6.1-terra")
+        || normalized.starts_with("gpt6.1-terra")
+        || normalized.starts_with("gpt-6-1-terra")
+    {
+        return Some(PricingRate {
+            input_per_million: 1.0,
+            cached_input_per_million: 0.05,
+            output_per_million: 5.0,
+        });
+    }
+    if normalized.starts_with("gpt-6-astra")
+        || normalized.starts_with("gpt6-astra")
+        || normalized.starts_with("gpt-6.1-astra")
+    {
+        return Some(PricingRate {
+            input_per_million: 10.0,
+            cached_input_per_million: 1.0,
+            output_per_million: 50.0,
+        });
+    }
+    if normalized.starts_with("gpt-6-sol") || normalized.starts_with("gpt6-sol") {
+        return Some(PricingRate {
+            input_per_million: 2.0,
+            cached_input_per_million: 0.2,
+            output_per_million: 10.0,
+        });
+    }
     if normalized == "gpt-5.6"
         || normalized == "gpt5.6"
         || normalized == "gpt-5-6"
@@ -2320,108 +2388,111 @@ fn pricing_rate_for_model(model: &str) -> PricingRate {
         || normalized.starts_with("gpt5.6-sol")
         || normalized.starts_with("gpt-5-6-sol")
     {
-        return PricingRate {
+        return Some(PricingRate {
             input_per_million: 5.0,
             cached_input_per_million: 0.5,
             output_per_million: 30.0,
-        };
+        });
     }
     if normalized.starts_with("gpt-5.6-terra")
         || normalized.starts_with("gpt5.6-terra")
         || normalized.starts_with("gpt-5-6-terra")
     {
-        return PricingRate {
+        return Some(PricingRate {
             input_per_million: 2.5,
             cached_input_per_million: 0.25,
             output_per_million: 15.0,
-        };
+        });
     }
     if normalized.starts_with("gpt-5.6-luna")
         || normalized.starts_with("gpt5.6-luna")
         || normalized.starts_with("gpt-5-6-luna")
     {
-        return PricingRate {
+        return Some(PricingRate {
             input_per_million: 1.0,
             cached_input_per_million: 0.1,
             output_per_million: 6.0,
-        };
+        });
     }
     if normalized.starts_with("gpt-5.5-pro") {
-        return PricingRate {
+        return Some(PricingRate {
             input_per_million: 30.0,
             cached_input_per_million: 30.0,
             output_per_million: 180.0,
-        };
+        });
     }
     if normalized.starts_with("gpt-5.5") {
-        return PricingRate {
+        return Some(PricingRate {
             input_per_million: 5.0,
             cached_input_per_million: 0.5,
             output_per_million: 30.0,
-        };
+        });
     }
     if normalized.starts_with("gpt-5.4-pro") {
-        return PricingRate {
+        return Some(PricingRate {
             input_per_million: 30.0,
             cached_input_per_million: 30.0,
             output_per_million: 180.0,
-        };
+        });
     }
     if normalized.starts_with("gpt-5.4-mini") {
-        return PricingRate {
+        return Some(PricingRate {
             input_per_million: 0.75,
             cached_input_per_million: 0.075,
             output_per_million: 4.5,
-        };
+        });
     }
     if normalized.starts_with("gpt-5.4-nano") {
-        return PricingRate {
+        return Some(PricingRate {
             input_per_million: 0.2,
             cached_input_per_million: 0.02,
             output_per_million: 1.25,
-        };
+        });
     }
     if normalized.starts_with("gpt-5.4") {
-        return PricingRate {
+        return Some(PricingRate {
             input_per_million: 2.5,
             cached_input_per_million: 0.25,
             output_per_million: 15.0,
-        };
+        });
     }
     if normalized.contains("codex-mini") || normalized.starts_with("gpt-5-mini") {
-        return PricingRate {
+        return Some(PricingRate {
             input_per_million: 0.25,
             cached_input_per_million: 0.025,
             output_per_million: 2.0,
-        };
+        });
     }
     if normalized.starts_with("gpt-5-nano") {
-        return PricingRate {
+        return Some(PricingRate {
             input_per_million: 0.05,
             cached_input_per_million: 0.005,
             output_per_million: 0.4,
-        };
+        });
     }
     if normalized.starts_with("o4-mini") {
-        return PricingRate {
+        return Some(PricingRate {
             input_per_million: 1.1,
             cached_input_per_million: 0.275,
             output_per_million: 4.4,
-        };
+        });
     }
     if normalized.starts_with("o3") {
-        return PricingRate {
+        return Some(PricingRate {
             input_per_million: 2.0,
             cached_input_per_million: 0.5,
             output_per_million: 8.0,
-        };
+        });
     }
 
-    PricingRate {
-        input_per_million: 1.25,
-        cached_input_per_million: 0.125,
-        output_per_million: 10.0,
-    }
+    None
+}
+
+fn truncate_sessions(
+    sessions: Vec<CodexSessionCostBreakdown>,
+) -> (usize, Vec<CodexSessionCostBreakdown>) {
+    let total = sessions.len();
+    (total, sessions.into_iter().take(SESSION_EXPORT_LIMIT).collect())
 }
 
 fn initial_heatmap() -> BTreeMap<(u8, u8), CodexHourlyCostBucket> {
@@ -2940,6 +3011,133 @@ mod tests {
             );
             assert_eq!(rate.output_per_million, output, "output price for {model}");
         }
+    }
+
+
+    #[test]
+    fn uses_official_gpt_6_pricing() {
+        for (model, input, cached, output) in [
+            ("gpt-6-astra", 10.0, 1.0, 50.0),
+            ("gpt-6.1-sol", 2.0, 0.1, 10.0),
+            ("gpt-6.1-terra", 1.0, 0.05, 5.0),
+            ("gpt-6-sol", 2.0, 0.2, 10.0),
+            ("gpt-6-astra-2026-10-01", 10.0, 1.0, 50.0),
+        ] {
+            let rate = pricing_rate_for_model(model);
+            assert_eq!(rate.input_per_million, input, "input price for {model}");
+            assert_eq!(
+                rate.cached_input_per_million, cached,
+                "cached input price for {model}"
+            );
+            assert_eq!(rate.output_per_million, output, "output price for {model}");
+            assert!(
+                pricing_rate_for_model_known(model).is_some(),
+                "{model} should be a known-priced model"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_model_keeps_fallback_rate_and_is_reported() {
+        assert!(pricing_rate_for_model_known("gpt-7-unknown").is_none());
+        let fallback = pricing_rate_for_model("gpt-7-unknown");
+        assert_eq!(fallback.input_per_million, 1.25);
+        assert_eq!(fallback.cached_input_per_million, 0.125);
+        assert_eq!(fallback.output_per_million, 10.0);
+    }
+
+    #[test]
+    fn collects_unknown_pricing_models_in_cost_snapshot() {
+        let root = unique_temp_dir();
+        let sessions = root.join("sessions").join("2026").join("11").join("01");
+        fs::create_dir_all(&sessions).expect("create sessions dir");
+        fs::write(
+            sessions.join("rollout-unknown-model.jsonl"),
+            [
+                session_meta_line(
+                    "2026-11-01T10:00:00Z",
+                    "unknown-model-session",
+                    None,
+                    "/tmp/unknown-model-project",
+                    "gpt-7-unknown",
+                ),
+                analytics_token_line("2026-11-01T10:01:00Z", 100, 0, 10),
+            ]
+            .join("\n"),
+        )
+        .expect("write unknown model log");
+
+        let now = parse_timestamp("2026-11-02T00:00:00Z").expect("parse now");
+        let snapshot =
+            scan_codex_cost_analytics_roots_with_progress(&[root.join("sessions")], now, |_| {});
+
+        assert_eq!(
+            snapshot.pricing_unknown_models,
+            vec!["gpt-7-unknown".to_string()]
+        );
+        assert!(
+            snapshot.total_cost_usd > 0.0,
+            "未知模型仍应按兜底费率估算成本，而不是 0"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn older_cost_analytics_cache_version_is_rejected() {
+        let root = unique_temp_dir();
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).expect("create sessions dir");
+        let snapshot =
+            scan_codex_cost_analytics_roots_with_progress(&[sessions], 1_800_000_000, |_| {});
+        let cache_text = String::from_utf8(
+            serialize_codex_cost_analytics_cache(&snapshot).expect("serialize cache"),
+        )
+        .expect("cache utf8");
+        let current = parse_codex_cost_analytics_cache(&cache_text).expect("parse current cache");
+        assert!(current.is_some(), "current cache version should parse");
+
+        let previous_version = cache_text.replacen(
+            &format!("\"version\": {}", COST_ANALYTICS_CACHE_VERSION),
+            &format!("\"version\": {}", COST_ANALYTICS_CACHE_VERSION - 1),
+            1,
+        );
+        assert_ne!(previous_version, cache_text, "cache version field should exist");
+        assert!(
+            parse_codex_cost_analytics_cache(&previous_version)
+                .expect("parse previous cache")
+                .is_none(),
+            "旧版本缓存应被拒绝，触发重算"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+
+    #[test]
+    fn session_total_counts_sessions_before_display_truncation() {
+        let sessions = (0..=SESSION_EXPORT_LIMIT)
+            .map(|index| CodexSessionCostBreakdown {
+                session_id: format!("session-{index}"),
+                parent_session_id: None,
+                project_path: "/tmp/project".to_string(),
+                project_name: "project".to_string(),
+                started_at: Some(1),
+                updated_at: Some(2),
+                duration_seconds: Some(1),
+                prompt_count: 0,
+                event_count: 0,
+                model: "gpt-6-astra".to_string(),
+                total: CodexTokenTotals::default(),
+                cost_usd: 0.0,
+                source_path: format!("/tmp/session-{index}.jsonl"),
+            })
+            .collect::<Vec<_>>();
+
+        let (total, kept) = truncate_sessions(sessions);
+
+        assert_eq!(total, SESSION_EXPORT_LIMIT + 1);
+        assert_eq!(kept.len(), SESSION_EXPORT_LIMIT);
     }
 
     #[test]

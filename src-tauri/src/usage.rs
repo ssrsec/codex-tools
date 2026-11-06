@@ -1,9 +1,10 @@
 use serde::Deserialize;
+use serde::Deserializer;
+use serde_json::Value;
 use std::error::Error as StdError;
 
 use crate::app_paths;
 use crate::models::CreditSnapshot;
-use crate::models::ResetCredit;
 use crate::models::ResetCreditsSnapshot;
 use crate::models::UsageSnapshot;
 use crate::models::UsageWindow;
@@ -13,40 +14,77 @@ use crate::utils::truncate_for_error;
 const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com";
 const CODEX_USAGE_PATH: &str = "/api/codex/usage";
 const WHAM_USAGE_PATH: &str = "/wham/usage";
-const WHAM_RESET_CREDITS_PATH: &str = "/wham/rate-limit-reset-credits";
 const BACKEND_API_PREFIX: &str = "/backend-api";
 
 #[derive(Debug, Deserialize)]
 struct UsageApiResponse {
     plan_type: Option<String>,
     rate_limit: Option<RateLimitDetails>,
+    /// 按功能/模型划分的附加额度。本期只做“容忍解析”（不参与主额度判定）。
+    #[serde(default)]
+    #[allow(dead_code)]
     additional_rate_limits: Option<Vec<AdditionalRateLimitDetails>>,
     credits: Option<CreditDetails>,
+    /// 形如 { "type": "workspace_member_credits_depleted" }，也可能直接是字符串。
+    #[serde(default)]
+    rate_limit_reached_type: Option<Value>,
+    /// 内联的可用重置券数量（无需再请求 /wham/rate-limit-reset-credits）。
+    #[serde(default)]
+    rate_limit_reset_credits: Option<ResetCreditsSummary>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RateLimitDetails {
+    #[serde(default)]
+    allowed: Option<bool>,
+    #[serde(default)]
+    limit_reached: Option<bool>,
     primary_window: Option<UsageWindowRaw>,
     secondary_window: Option<UsageWindowRaw>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct AdditionalRateLimitDetails {
+    #[serde(default)]
+    limit_name: Option<String>,
+    #[serde(default)]
+    metered_feature: Option<String>,
+    #[serde(default)]
+    normal_model_slug: Option<String>,
     rate_limit: Option<RateLimitDetails>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UsageWindowRaw {
+    #[serde(deserialize_with = "deserialize_number_or_string_f64")]
     used_percent: f64,
+    #[serde(deserialize_with = "deserialize_number_or_string_i64")]
     limit_window_seconds: i64,
-    reset_at: i64,
+    #[serde(default, deserialize_with = "deserialize_opt_i64_number_or_string")]
+    reset_at: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_opt_i64_number_or_string")]
+    reset_after_seconds: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CreditDetails {
+    #[serde(default)]
     has_credits: bool,
+    #[serde(default)]
     unlimited: bool,
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_number")]
     balance: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResetCreditsSummary {
+    #[serde(
+        default,
+        alias = "availableCount",
+        deserialize_with = "deserialize_opt_i64_number_or_string"
+    )]
+    available_count: Option<i64>,
 }
 
 pub(crate) async fn fetch_usage_snapshot(
@@ -95,8 +133,8 @@ pub(crate) async fn fetch_usage_snapshot(
                 continue;
             }
         };
-        let reset_credits = fetch_reset_credits_snapshot(&client, access_token, account_id).await;
-        return Ok(map_usage_payload(payload, reset_credits));
+        // 重置券数量已内联在 /wham/usage 响应里，不再额外请求。
+        return Ok(map_usage_payload(payload));
     }
 
     if errors.is_empty() {
@@ -135,35 +173,6 @@ fn resolve_usage_urls() -> Vec<String> {
 
     candidates.push("https://chatgpt.com/backend-api/wham/usage".to_string());
     candidates.push(format!("https://chatgpt.com{CODEX_USAGE_PATH}"));
-
-    let mut deduped = Vec::new();
-    for url in candidates {
-        if !deduped.iter().any(|existing| existing == &url) {
-            deduped.push(url);
-        }
-    }
-    deduped
-}
-
-fn resolve_reset_credit_urls() -> Vec<String> {
-    let normalized = resolve_chatgpt_base_origin();
-    let mut candidates = Vec::new();
-
-    if let Some(origin) = normalized.strip_suffix(BACKEND_API_PREFIX) {
-        candidates.push(format!("{normalized}{WHAM_RESET_CREDITS_PATH}"));
-        candidates.push(format!(
-            "{origin}{BACKEND_API_PREFIX}{WHAM_RESET_CREDITS_PATH}"
-        ));
-    } else {
-        candidates.push(format!(
-            "{normalized}{BACKEND_API_PREFIX}{WHAM_RESET_CREDITS_PATH}"
-        ));
-        candidates.push(format!("{normalized}{WHAM_RESET_CREDITS_PATH}"));
-    }
-
-    candidates.push(format!(
-        "https://chatgpt.com{BACKEND_API_PREFIX}{WHAM_RESET_CREDITS_PATH}"
-    ));
 
     let mut deduped = Vec::new();
     for url in candidates {
@@ -213,297 +222,423 @@ fn read_chatgpt_base_url_from_config() -> Option<String> {
     None
 }
 
-async fn fetch_reset_credits_snapshot(
-    client: &reqwest::Client,
-    access_token: &str,
-    account_id: &str,
-) -> Option<ResetCreditsSnapshot> {
-    let mut errors = Vec::new();
+const FIVE_HOUR_SECONDS: i64 = 18_000;
+const ONE_WEEK_SECONDS: i64 = 604_800;
 
-    for reset_url in resolve_reset_credit_urls() {
-        let response = match client
-            .get(&reset_url)
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("ChatGPT-Account-Id", account_id)
-            .header("Accept", "application/json")
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                errors.push(format!("{reset_url} -> {}", format_reqwest_error(&err)));
-                continue;
-            }
-        };
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            errors.push(format!(
-                "{reset_url} -> {status}: {}",
-                truncate_for_error(&body, 140)
-            ));
-            continue;
-        }
-
-        let payload: serde_json::Value = match response.json().await {
-            Ok(payload) => payload,
-            Err(err) => {
-                errors.push(format!("{reset_url} -> 解析返回失败: {err}"));
-                continue;
-            }
-        };
-
-        return Some(map_reset_credits_payload(payload));
-    }
-
-    if !errors.is_empty() {
-        log::debug!(
-            "获取 Codex 重置卡失败: {}",
-            errors
-                .iter()
-                .take(2)
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(" | ")
-        );
-    }
-    None
+fn map_usage_payload(payload: UsageApiResponse) -> UsageSnapshot {
+    map_usage_payload_at(payload, now_unix_seconds())
 }
 
-fn map_usage_payload(
-    payload: UsageApiResponse,
-    reset_credits: Option<ResetCreditsSnapshot>,
-) -> UsageSnapshot {
-    let mut primary_windows: Vec<UsageWindowRaw> = Vec::new();
-    let mut fallback_windows: Vec<UsageWindowRaw> = Vec::new();
-
-    if let Some(rate_limit) = payload.rate_limit {
-        if let Some(primary) = rate_limit.primary_window {
-            primary_windows.push(primary);
-        }
-        if let Some(secondary) = rate_limit.secondary_window {
-            primary_windows.push(secondary);
-        }
+fn map_usage_payload_at(payload: UsageApiResponse, fetched_at: i64) -> UsageSnapshot {
+    let rate_limit = payload.rate_limit;
+    let allowed = rate_limit.as_ref().and_then(|details| details.allowed);
+    let limit_reached = rate_limit.as_ref().and_then(|details| details.limit_reached);
+    let additional_without_main = rate_limit.is_none()
+        && payload
+            .additional_rate_limits
+            .as_deref()
+            .is_some_and(|limits| !limits.is_empty());
+    let (five_hour, one_week, windows) = classify_usage_windows(rate_limit, fetched_at);
+    if additional_without_main {
+        // 主额度缺失时 additional_rate_limits 只是按功能划分的附加额度，不能当作主额度判定，
+        // 否则会把“没有主额度信息”误当成“额度充足”。这里只记录，便于线上定位异常响应。
+        log::debug!("用量响应缺少主额度窗口，additional_rate_limits 未参与主额度判定");
     }
-
-    if let Some(additional) = payload.additional_rate_limits {
-        for limit in additional {
-            if let Some(rate_limit) = limit.rate_limit {
-                if let Some(primary) = rate_limit.primary_window {
-                    fallback_windows.push(primary);
-                }
-                if let Some(secondary) = rate_limit.secondary_window {
-                    fallback_windows.push(secondary);
-                }
-            }
-        }
-    }
-
-    // Codex 已不再提供旧的 5 小时额度。保留 five_hour 字段仅用于读取旧缓存，
-    // 新快照只写入服务端返回的主额度窗口，避免把唯一的 7 天窗口复制成“5h + 1w”。
-    let active_window = longest_window(&primary_windows)
-        .or_else(|| longest_window(&fallback_windows))
-        .map(to_usage_window);
 
     UsageSnapshot {
-        fetched_at: now_unix_seconds(),
+        fetched_at,
         plan_type: payload.plan_type,
-        five_hour: None,
-        one_week: active_window,
+        five_hour,
+        one_week,
+        windows,
+        allowed,
+        limit_reached,
+        rate_limit_reached_type: map_rate_limit_reached_type(payload.rate_limit_reached_type),
         credits: payload.credits.map(|credit| CreditSnapshot {
             has_credits: credit.has_credits,
             unlimited: credit.unlimited,
             balance: credit.balance,
         }),
-        reset_credits,
+        reset_credits: payload
+            .rate_limit_reset_credits
+            .map(|summary| ResetCreditsSnapshot {
+                available_count: summary.available_count,
+                credits: Vec::new(),
+            }),
     }
 }
 
-fn map_reset_credits_payload(payload: serde_json::Value) -> ResetCreditsSnapshot {
-    let available_count = payload
-        .get("available_count")
-        .or_else(|| payload.get("availableCount"))
-        .and_then(parse_optional_i64);
+/// 按秒分类主额度窗口：18000→5 小时，604800→1 周，其余只进 windows[]。
+///
+/// 注意：30 天窗口**不得**当作周窗口，避免把月额度按周展示/按周判定耗尽。
+fn classify_usage_windows(
+    rate_limit: Option<RateLimitDetails>,
+    fetched_at: i64,
+) -> (Option<UsageWindow>, Option<UsageWindow>, Vec<UsageWindow>) {
+    let mut five_hour = None;
+    let mut one_week = None;
+    let mut windows = Vec::new();
 
-    let credits = payload
-        .get("credits")
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| ResetCredit {
-                    granted_at: get_timestamp_field(
-                        item,
-                        &[
-                            "granted_at",
-                            "grantedAt",
-                            "created_at",
-                            "createdAt",
-                            "obtained_at",
-                            "obtainedAt",
-                        ],
-                    ),
-                    expires_at: get_timestamp_field(
-                        item,
-                        &[
-                            "expires_at",
-                            "expiresAt",
-                            "expiration",
-                            "expire_at",
-                            "expireAt",
-                        ],
-                    ),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let Some(rate_limit) = rate_limit else {
+        return (None, None, windows);
+    };
 
-    ResetCreditsSnapshot {
-        available_count,
-        credits,
-    }
-}
-
-fn get_timestamp_field(value: &serde_json::Value, keys: &[&str]) -> Option<i64> {
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(parse_optional_i64))
-}
-
-fn parse_optional_i64(value: &serde_json::Value) -> Option<i64> {
-    if let Some(number) = value.as_i64() {
-        return Some(normalize_epoch_seconds(number));
-    }
-
-    if let Some(number) = value.as_u64() {
-        return i64::try_from(number).ok().map(normalize_epoch_seconds);
-    }
-
-    if let Some(text) = value
-        .as_str()
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
+    for raw in [rate_limit.primary_window, rate_limit.secondary_window]
+        .into_iter()
+        .flatten()
     {
-        if let Ok(number) = text.parse::<i64>() {
-            return Some(normalize_epoch_seconds(number));
-        }
-        if let Ok(parsed) =
-            time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
-        {
-            return Some(parsed.unix_timestamp());
+        let window = to_usage_window(raw, fetched_at);
+        match window.window_seconds {
+            FIVE_HOUR_SECONDS => keep_most_constrained(&mut five_hour, window),
+            ONE_WEEK_SECONDS => keep_most_constrained(&mut one_week, window),
+            _ => windows.push(window),
         }
     }
+    windows.sort_by_key(|window| window.window_seconds);
 
-    None
+    (five_hour, one_week, windows)
+}
+
+fn keep_most_constrained(slot: &mut Option<UsageWindow>, window: UsageWindow) {
+    let should_replace = slot
+        .as_ref()
+        .map(|current| window.used_percent > current.used_percent)
+        .unwrap_or(true);
+    if should_replace {
+        *slot = Some(window);
+    }
+}
+
+fn to_usage_window(raw: UsageWindowRaw, fetched_at: i64) -> UsageWindow {
+    let reset_at = raw
+        .reset_at
+        .map(normalize_epoch_seconds)
+        .or_else(|| {
+            raw.reset_after_seconds
+                .map(|seconds| fetched_at.saturating_add(seconds))
+        })
+        .or_else(|| Some(fetched_at.saturating_add(raw.limit_window_seconds.max(0))));
+
+    UsageWindow {
+        used_percent: raw.used_percent,
+        window_seconds: raw.limit_window_seconds,
+        reset_at,
+    }
+}
+
+fn map_rate_limit_reached_type(value: Option<Value>) -> Option<String> {
+    match value? {
+        Value::String(text) => Some(text),
+        Value::Object(object) => object
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
 }
 
 fn normalize_epoch_seconds(value: i64) -> i64 {
-    if value > 10_000_000_000 {
+    if value.abs() > 10_000_000_000 {
         value / 1000
     } else {
         value
     }
 }
 
-fn longest_window(windows: &[UsageWindowRaw]) -> Option<UsageWindowRaw> {
-    windows
-        .iter()
-        .max_by_key(|window| window.limit_window_seconds)
-        .map(|window| UsageWindowRaw {
-            used_percent: window.used_percent,
-            limit_window_seconds: window.limit_window_seconds,
-            reset_at: window.reset_at,
-        })
+fn value_to_f64(value: &Value) -> Option<f64> {
+    if let Some(number) = value.as_f64() {
+        return number.is_finite().then_some(number);
+    }
+    let text = value.as_str()?.trim();
+    text.parse::<f64>()
+        .ok()
+        .filter(|parsed| parsed.is_finite())
 }
 
-fn to_usage_window(window: UsageWindowRaw) -> UsageWindow {
-    UsageWindow {
-        used_percent: window.used_percent,
-        window_seconds: window.limit_window_seconds,
-        reset_at: Some(window.reset_at),
+fn value_to_i64(value: &Value) -> Option<i64> {
+    if let Some(number) = value.as_i64() {
+        return Some(number);
+    }
+    if let Some(number) = value.as_u64() {
+        return i64::try_from(number).ok();
+    }
+    if let Some(number) = value.as_f64() {
+        return number.is_finite().then(|| number.round() as i64);
+    }
+    let text = value.as_str()?.trim();
+    if let Ok(parsed) = text.parse::<i64>() {
+        return Some(parsed);
+    }
+    text.parse::<f64>()
+        .ok()
+        .filter(|parsed| parsed.is_finite())
+        .map(|parsed| parsed.round() as i64)
+}
+
+fn deserialize_number_or_string_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    value_to_f64(&value).ok_or_else(|| serde::de::Error::custom("用量百分比不是有效数字"))
+}
+
+fn deserialize_number_or_string_i64<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    value_to_i64(&value).ok_or_else(|| serde::de::Error::custom("额度窗口秒数不是有效数字"))
+}
+
+fn deserialize_opt_i64_number_or_string<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value_to_i64(&value)
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("时间字段不是有效数字")),
+    }
+}
+
+fn deserialize_opt_string_or_number<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(Value::Number(number)) => Ok(Some(number.to_string())),
+        Some(_) => Err(serde::de::Error::custom("金额字段类型不支持")),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::map_reset_credits_payload;
-    use super::map_usage_payload;
-    use super::RateLimitDetails;
+    use super::map_usage_payload_at;
     use super::UsageApiResponse;
-    use super::UsageWindowRaw;
+    use crate::models::UsageSnapshot;
     use serde_json::json;
 
-    #[test]
-    fn reset_credits_payload_accepts_common_timestamp_shapes() {
-        let snapshot = map_reset_credits_payload(json!({
-            "available_count": 2,
-            "credits": [
-                {
-                    "granted_at": 1_797_392_400,
-                    "expires_at": 1_799_984_400_000i64
-                },
-                {
-                    "createdAt": "2026-12-15T10:00:00Z",
-                    "expiresAt": "2027-01-14T10:00:00Z"
-                }
-            ]
-        }));
-
-        assert_eq!(snapshot.available_count, Some(2));
-        assert_eq!(snapshot.credits.len(), 2);
-        assert_eq!(snapshot.credits[0].granted_at, Some(1_797_392_400));
-        assert_eq!(snapshot.credits[0].expires_at, Some(1_799_984_400));
-        assert_eq!(snapshot.credits[1].granted_at, Some(1_797_328_800));
-        assert_eq!(snapshot.credits[1].expires_at, Some(1_799_920_800));
+    fn snapshot_from_payload(payload: serde_json::Value, now: i64) -> UsageSnapshot {
+        let parsed: UsageApiResponse =
+            serde_json::from_value(payload).expect("usage payload should deserialize");
+        map_usage_payload_at(parsed, now)
     }
 
     #[test]
-    fn reset_credits_payload_accepts_camel_case_available_count() {
-        let snapshot = map_reset_credits_payload(json!({
-            "availableCount": "1",
-            "credits": [
-                {
-                    "obtained_at": "1797392400",
-                    "expireAt": null
-                }
-            ]
-        }));
+    fn usage_payload_keeps_primary_and_secondary_windows_with_metadata() {
+        let now = 1_700_000_000;
+        let snapshot = snapshot_from_payload(
+            json!({
+                "plan_type": "pro",
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": "42",
+                        "limit_window_seconds": "18000",
+                        "reset_at": 1_800_000_000
+                    },
+                    "secondary_window": {
+                        "used_percent": 7.5,
+                        "limit_window_seconds": 604_800,
+                        "reset_at": "1800600000"
+                    }
+                },
+                "credits": {
+                    "has_credits": true,
+                    "unlimited": false,
+                    "balance": "9.99"
+                },
+                "rate_limit_reached_type": {
+                    "type": "workspace_member_credits_depleted"
+                },
+                "rate_limit_reset_credits": { "available_count": "2" }
+            }),
+            now,
+        );
 
-        assert_eq!(snapshot.available_count, Some(1));
-        assert_eq!(snapshot.credits[0].granted_at, Some(1_797_392_400));
-        assert_eq!(snapshot.credits[0].expires_at, None);
+        assert_eq!(snapshot.fetched_at, now);
+        assert_eq!(snapshot.plan_type.as_deref(), Some("pro"));
+        let five_hour = snapshot.five_hour.expect("5h window");
+        assert_eq!(five_hour.window_seconds, 18_000);
+        assert_eq!(five_hour.used_percent, 42.0);
+        assert_eq!(five_hour.reset_at, Some(1_800_000_000));
+        let one_week = snapshot.one_week.expect("weekly window");
+        assert_eq!(one_week.window_seconds, 604_800);
+        assert_eq!(one_week.used_percent, 7.5);
+        assert_eq!(one_week.reset_at, Some(1_800_600_000));
+        assert!(snapshot.windows.is_empty());
+        assert_eq!(snapshot.allowed, Some(true));
+        assert_eq!(snapshot.limit_reached, Some(false));
+        assert_eq!(
+            snapshot.rate_limit_reached_type.as_deref(),
+            Some("workspace_member_credits_depleted")
+        );
+        let credits = snapshot.credits.expect("credits");
+        assert!(credits.has_credits);
+        assert!(!credits.unlimited);
+        assert_eq!(credits.balance.as_deref(), Some("9.99"));
+        let reset_credits = snapshot.reset_credits.expect("reset credits");
+        assert_eq!(reset_credits.available_count, Some(2));
+        assert!(reset_credits.credits.is_empty());
+    }
+
+    #[test]
+    fn usage_payload_maps_five_hour_only_window() {
+        let snapshot = snapshot_from_payload(
+            json!({
+                "plan_type": "plus",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 100,
+                        "limit_window_seconds": 18_000,
+                        "reset_at": 1_800_000_000
+                    }
+                }
+            }),
+            1_700_000_000,
+        );
+
+        assert!(snapshot.five_hour.is_some());
+        assert!(snapshot.one_week.is_none());
+        assert!(snapshot.windows.is_empty());
+        assert_eq!(snapshot.allowed, None);
+        assert_eq!(snapshot.limit_reached, None);
+    }
+
+    #[test]
+    fn usage_payload_maps_30_day_window_to_windows_only() {
+        let now = 1_700_000_000;
+        let snapshot = snapshot_from_payload(
+            json!({
+                "plan_type": "free",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 12,
+                        "limit_window_seconds": 2_592_000
+                    }
+                }
+            }),
+            now,
+        );
+
+        assert!(snapshot.five_hour.is_none(), "30 天不得当作 5h");
+        assert!(snapshot.one_week.is_none(), "30 天不得当作周窗口");
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.windows[0].window_seconds, 2_592_000);
+        assert_eq!(snapshot.windows[0].used_percent, 12.0);
+        assert_eq!(
+            snapshot.windows[0].reset_at,
+            Some(now.saturating_add(2_592_000)),
+            "缺省 reset_at 用 fetched_at + window 兜底"
+        );
+    }
+
+    #[test]
+    fn usage_payload_accepts_string_numbers_and_missing_reset_at() {
+        let now = 1_700_000_000;
+        let snapshot = snapshot_from_payload(
+            json!({
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": "42.5",
+                        "limit_window_seconds": "18000",
+                        "reset_after_seconds": "600"
+                    }
+                }
+            }),
+            now,
+        );
+
+        let five_hour = snapshot.five_hour.expect("5h window");
+        assert_eq!(five_hour.used_percent, 42.5);
+        assert_eq!(five_hour.window_seconds, 18_000);
+        assert_eq!(five_hour.reset_at, Some(now.saturating_add(600)));
+    }
+
+    #[test]
+    fn usage_payload_accepts_numeric_credit_balance() {
+        let snapshot = snapshot_from_payload(
+            json!({
+                "credits": {
+                    "has_credits": true,
+                    "unlimited": false,
+                    "balance": 9.99
+                }
+            }),
+            1_700_000_000,
+        );
+
+        let credits = snapshot.credits.expect("credits");
+        assert_eq!(credits.balance.as_deref(), Some("9.99"));
+    }
+
+    #[test]
+    fn usage_payload_tolerates_additional_rate_limits_without_using_them_as_main_quota() {
+        let snapshot = snapshot_from_payload(
+            json!({
+                "plan_type": "business",
+                "additional_rate_limits": [
+                    {
+                        "limit_name": "codex_other",
+                        "metered_feature": "codex_other",
+                        "normal_model_slug": "gpt-6-astra",
+                        "rate_limit": {
+                            "allowed": true,
+                            "limit_reached": false,
+                            "primary_window": {
+                                "used_percent": 70,
+                                "limit_window_seconds": 900,
+                                "reset_at": 1_800_000_000
+                            }
+                        }
+                    }
+                ]
+            }),
+            1_700_000_000,
+        );
+
+        assert!(snapshot.five_hour.is_none());
+        assert!(snapshot.one_week.is_none());
+        assert!(snapshot.windows.is_empty());
     }
 
     #[test]
     fn usage_payload_keeps_single_week_window_without_fabricating_five_hour_usage() {
-        let snapshot = map_usage_payload(
-            UsageApiResponse {
-                plan_type: Some("plus".to_string()),
-                rate_limit: Some(RateLimitDetails {
-                    primary_window: Some(UsageWindowRaw {
-                        used_percent: 42.0,
-                        limit_window_seconds: 604_800,
-                        reset_at: 1_800_000_000,
-                    }),
-                    secondary_window: None,
-                }),
-                additional_rate_limits: None,
-                credits: None,
-            },
-            None,
+        let snapshot = snapshot_from_payload(
+            json!({
+                "plan_type": "plus",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 42.0,
+                        "limit_window_seconds": 604_800,
+                        "reset_at": 1_800_000_000
+                    }
+                }
+            }),
+            1_700_000_000,
         );
 
         assert!(snapshot.five_hour.is_none());
-        assert_eq!(
-            snapshot
-                .one_week
-                .as_ref()
-                .map(|window| window.window_seconds),
-            Some(604_800)
+        let one_week = snapshot.one_week.expect("weekly window");
+        assert_eq!(one_week.window_seconds, 604_800);
+        assert_eq!(one_week.used_percent, 42.0);
+    }
+
+    #[test]
+    fn usage_payload_accepts_plain_string_rate_limit_reached_type() {
+        let snapshot = snapshot_from_payload(
+            json!({ "plan_type": "pro", "rate_limit_reached_type": "rate_limit_reached" }),
+            1_700_000_000,
         );
+
         assert_eq!(
-            snapshot.one_week.as_ref().map(|window| window.used_percent),
-            Some(42.0)
+            snapshot.rate_limit_reached_type.as_deref(),
+            Some("rate_limit_reached")
         );
     }
 }

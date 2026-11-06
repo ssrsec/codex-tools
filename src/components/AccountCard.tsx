@@ -6,6 +6,7 @@ import {
   formatWindowLabel,
   percent,
   planTone,
+  primaryUsageWindow,
   remainingPercent,
 } from "../utils/usage";
 
@@ -194,7 +195,8 @@ export function AccountCard({
   const usage = selectedAccount.usage;
   const isRelay = selectedAccount.sourceKind === "relay";
   const fiveHour = usage?.fiveHour ?? null;
-  const oneWeek = usage?.oneWeek ?? null;
+  // 主额度窗口：优先周窗口；free 的 30 天窗口只放在 windows[]，这里回退取最长窗口。
+  const primaryWindow = primaryUsageWindow(usage);
   const normalizedPlan = isRelay ? "api" : selectedAccount.planType || usage?.planType;
   const tone = planTone(normalizedPlan);
   const isSwitching = switchingId === selectedAccount.id;
@@ -205,7 +207,7 @@ export function AccountCard({
   const displayUsagePercent = (window: UsageWindow | null) => remainingPercent(window);
   const launchLabel = isSwitching ? copy.accountCard.launching : copy.accountCard.launch;
   const fiveHourReset = formatResetValue(fiveHour?.resetAt, locale);
-  const oneWeekReset = formatResetValue(oneWeek?.resetAt, locale);
+  const primaryWindowReset = formatResetValue(primaryWindow?.resetAt, locale);
   const normalizedDraftLabel = draftLabel.trim();
   const proxyToggleLabel = selectedAccount.apiProxyEnabled
     ? copy.accountCard.apiProxyEnabled
@@ -417,7 +419,9 @@ export function AccountCard({
 
       {!isRelay ? (
         <div className={`usageGrid ${isFreePlan ? "isFreePlan" : ""}`}>
-          {!isFreePlan && (
+          {/* 5h 档位只在后端确实返回 five_hour 时渲染；free 的 30 天窗口
+              只作为主额度窗口显示为“30天”，不再补一个空的 5h dial。 */}
+          {fiveHour && (
             <UsageDial
               accent="hot"
               centerLabel={usageCenterLabel}
@@ -435,15 +439,15 @@ export function AccountCard({
           <UsageDial
             accent="cool"
             centerLabel={usageCenterLabel}
-            label={formatWindowLabel(oneWeek, {
+            label={formatWindowLabel(primaryWindow, {
               fallback: copy.accountCard.oneWeekFallback,
               oneWeek: copy.accountCard.oneWeekLabel,
               hourSuffix: copy.accountCard.hourSuffix,
               minuteSuffix: copy.accountCard.minuteSuffix,
             })}
             resetTitle={copy.accountCard.resetAt}
-            resetValue={oneWeekReset}
-            displayPercent={displayUsagePercent(oneWeek)}
+            resetValue={primaryWindowReset}
+            displayPercent={displayUsagePercent(primaryWindow)}
           />
         </div>
       ) : null}

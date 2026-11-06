@@ -7,10 +7,14 @@ import { classifyUsageRefreshError } from "../utils/usageRefreshError";
 import {
   formatPlan,
   formatTokenCount,
+  formatWindowLabel,
   percent,
+  planGroup,
   planTone,
+  primaryUsageWindow,
   remainingPercent,
   toProgressWidth,
+  type PlanGroup,
 } from "../utils/usage";
 
 type AccountGroup = {
@@ -82,20 +86,21 @@ type AccountsGridProps = {
   onDelete: (account: AccountSummary) => void;
 };
 
-const PLAN_PRIORITY: Record<string, number> = {
+// 按 plan 分组排序：Pro 三档（prolite/pro/promax）同组，避免同账号变体被拆散。
+const PLAN_GROUP_PRIORITY: Record<PlanGroup, number> = {
   api: 0,
-  team: 0,
+  business: 0,
   enterprise: 1,
-  business: 2,
+  edu: 2,
   pro: 3,
   plus: 4,
+  go: 4,
   free: 5,
   unknown: 6,
 };
 
 function planPriority(planType: string | null | undefined): number {
-  const normalized = planType?.trim().toLowerCase() ?? "";
-  return PLAN_PRIORITY[normalized] ?? PLAN_PRIORITY.unknown;
+  return PLAN_GROUP_PRIORITY[planGroup(planType)];
 }
 
 function sortVariantsForGroup(left: AccountSummary, right: AccountSummary): number {
@@ -124,7 +129,7 @@ function accountIssueReason(
   );
   const isFreePlan =
     account.sourceKind === "chatgpt" &&
-    (account.usage?.planType ?? account.planType ?? "").trim().toLowerCase() === "free";
+    planGroup(account.usage?.planType ?? account.planType) === "free";
   return (
     account.profileIntegrityError ||
     account.profileLastValidationError ||
@@ -159,7 +164,8 @@ function getUiCopy(locale: string): UiCopy {
       statusIssue: "异常账号",
       issueFallbackReason: "查看账号授权和用量状态",
       tokenUsageTitle: "有效 Token",
-      tokenUsageHint: "仅统计主会话的非缓存输入与输出，不含子任务和缓存输入",
+      tokenUsageHint:
+        "仅统计主会话的非缓存输入与输出，不含子任务和缓存输入；各窗口均为滚动口径（7 天 = 滚动 7×24 小时，含今天）",
       tokenUsageError: "Token 用量读取失败",
       weekUsage: "额度使用率",
       remainingSuffix: (value) => `剩余 ${value}`,
@@ -406,7 +412,7 @@ function UsageMeter({
   className,
 }: {
   label: string;
-  windowLabel: "1w";
+  windowLabel: string;
   window: UsageWindow | null;
   text: UiCopy;
   className?: string;
@@ -452,11 +458,29 @@ function TokenUsageStrip({
   exportingAccounts: boolean;
   onExportAll: () => void;
 }) {
+  // 账号区时间窗口均为“滚动 N×24 小时，含今天”口径，与成本分析的
+  // “前 7 个完整自然日”不同，故在标签 tooltip 里明确写出。
   const items = [
-    { label: "24H", value: tokenUsage?.last24hEffectiveTokens },
-    { label: "3D", value: tokenUsage?.last3dEffectiveTokens },
-    { label: "7D", value: tokenUsage?.last7dEffectiveTokens },
-    { label: "30D", value: tokenUsage?.last30dEffectiveTokens },
+    {
+      label: "24 小时",
+      title: "滚动 24 小时（含今天）",
+      value: tokenUsage?.last24hEffectiveTokens,
+    },
+    {
+      label: "3 天",
+      title: "滚动 3×24 小时（含今天）",
+      value: tokenUsage?.last3dEffectiveTokens,
+    },
+    {
+      label: "7 天",
+      title: "滚动 7×24 小时（含今天）",
+      value: tokenUsage?.last7dEffectiveTokens,
+    },
+    {
+      label: "30 天",
+      title: "滚动 30×24 小时（含今天）",
+      value: tokenUsage?.last30dEffectiveTokens,
+    },
   ];
 
   return (
@@ -464,7 +488,11 @@ function TokenUsageStrip({
       <strong title={text.tokenUsageHint}>{text.tokenUsageTitle}</strong>
       <div className="accountTokenUsageItems">
         {items.map((item) => (
-          <span key={item.label} className="accountTokenUsageItem">
+          <span
+            key={item.label}
+            className="accountTokenUsageItem"
+            title={item.title}
+          >
             <em>{item.label}</em>
             <b>{formatTokenCount(item.value, locale)}</b>
           </span>
@@ -681,7 +709,7 @@ export function AccountsGrid({
     return rows.filter((row) => {
       const account = row.account;
       const status = getAccountStatus(account, undefined, usageRefreshError);
-      const normalizedPlan = (account.planType || account.usage?.planType || "unknown").toLowerCase();
+      const plan = account.planType || account.usage?.planType;
       const haystack = [
         account.label,
         account.email,
@@ -697,7 +725,7 @@ export function AccountsGrid({
       return (
         (!normalizedQuery || haystack.includes(normalizedQuery)) &&
         (statusFilter === "all" || status === statusFilter) &&
-        (planFilter === "all" || normalizedPlan === planFilter)
+        (planFilter === "all" || planGroup(plan) === planFilter)
       );
     });
   }, [planFilter, query, rows, statusFilter, usageRefreshError]);
@@ -758,13 +786,12 @@ export function AccountsGrid({
               </select>
               <select value={planFilter} onChange={(event) => setPlanFilter(event.currentTarget.value)}>
                 <option value="all">{text.allPlans}</option>
-                <option value="pro">PRO</option>
-                <option value="plus">PLUS</option>
-                <option value="team">TEAM</option>
-                <option value="enterprise">ENTERPRISE</option>
-                <option value="business">BUSINESS</option>
+                <option value="pro">Pro</option>
+                <option value="plus">Plus</option>
+                <option value="business">Business</option>
+                <option value="enterprise">Enterprise</option>
                 <option value="api">API</option>
-                <option value="free">FREE</option>
+                <option value="free">免费</option>
               </select>
             </div>
             {toolbarActions ? <div className="accountToolbarActions">{toolbarActions}</div> : null}
@@ -816,6 +843,8 @@ export function AccountsGrid({
                   locale,
                   text,
                 );
+                // 主额度窗口：周窗口优先，没有周窗口时用 windows[] 最长（free 30 天）。
+                const quotaWindow = primaryUsageWindow(account.usage);
 
                 return (
                   <article
@@ -902,8 +931,13 @@ export function AccountsGrid({
                     <UsageMeter
                       className="accountUsageWeek"
                       label={text.weekUsage}
-                      windowLabel="1w"
-                      window={account.usage?.oneWeek ?? null}
+                      windowLabel={formatWindowLabel(quotaWindow, {
+                        fallback: text.weekUsage,
+                        oneWeek: "1周",
+                        hourSuffix: "小时",
+                        minuteSuffix: "分钟",
+                      })}
+                      window={quotaWindow}
                       text={text}
                     />
                     <div className="dateCell subscriptionCell">

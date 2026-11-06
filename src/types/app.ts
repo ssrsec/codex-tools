@@ -29,6 +29,11 @@ export type UsageSnapshot = {
   oneWeek: UsageWindow | null;
   credits: CreditSnapshot | null;
   resetCredits: ResetCreditsSnapshot | null;
+  // 后端 M4 新增：任意主额度窗口与 limit 真值字段；旧快照/旧远程回写时缺省。
+  windows?: UsageWindow[];
+  allowed?: boolean | null;
+  limitReached?: boolean | null;
+  rateLimitReachedType?: string | null;
 };
 
 export type CodexTokenTotals = {
@@ -137,6 +142,10 @@ export type CodexCostAnalyticsSnapshot = {
   costSourceError: string | null;
   projects: CodexProjectCostBreakdown[];
   sessions: CodexSessionCostBreakdown[];
+  // 后端 M2 新增：费率表未覆盖的模型名；非空时提示“成本为估算”。
+  pricingUnknownModels?: string[];
+  // 后端 M5 新增：截断前的会话总数；旧缓存/旧后端缺省。
+  sessionTotal?: number | null;
   heatmap: CodexHourlyCostBucket[];
   topPrompts: CodexPromptCostBreakdown[];
 };

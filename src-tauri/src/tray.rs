@@ -58,7 +58,7 @@ fn mode_percent(mode: TrayUsageDisplayMode, window: Option<&UsageWindow>) -> Opt
 }
 
 fn active_usage_window(usage: Option<&UsageSnapshot>) -> Option<&UsageWindow> {
-    usage.and_then(|usage| usage.one_week.as_ref())
+    usage.and_then(crate::models::usage_primary_window)
 }
 
 fn should_show_macos_status_item(mode: TrayUsageDisplayMode) -> bool {
@@ -102,6 +102,32 @@ fn tray_account_usage_line(
     )
 }
 
+/// 状态栏标题里的窗口缩写：5h / 1w / Nd / Nh。
+///
+/// 30 天等非标准窗口不能再写成 "1w"，否则标签与真实口径不符。
+#[cfg(target_os = "macos")]
+fn tray_window_label(window: Option<&UsageWindow>) -> String {
+    const FIVE_HOUR_SECONDS: i64 = 18_000;
+    const ONE_WEEK_SECONDS: i64 = 604_800;
+    const ONE_DAY_SECONDS: i64 = 86_400;
+
+    let Some(window) = window else {
+        return "1w".to_string();
+    };
+    let seconds = window.window_seconds.max(0);
+    if seconds <= FIVE_HOUR_SECONDS {
+        return "5h".to_string();
+    }
+    if (seconds - ONE_WEEK_SECONDS).abs() <= 12 * 3_600 {
+        return "1w".to_string();
+    }
+    if seconds >= 28 * ONE_DAY_SECONDS {
+        let days = ((seconds as f64) / (ONE_DAY_SECONDS as f64)).round() as i64;
+        return format!("{days}d");
+    }
+    format!("{}h", ((seconds as f64) / 3_600.0).round() as i64)
+}
+
 #[cfg(target_os = "macos")]
 fn build_macos_tray_title(
     accounts: &[AccountSummary],
@@ -113,19 +139,17 @@ fn build_macos_tray_title(
     }
 
     if let Some(current) = accounts.iter().find(|account| account.is_current) {
-        let selected_window = format_percent(mode_percent(
-            mode,
-            active_usage_window(current.usage.as_ref()),
-        ));
+        let window = active_usage_window(current.usage.as_ref());
+        let selected_window = format_percent(mode_percent(mode, window));
         return if show_window_labels {
-            format!("1w {selected_window}")
+            format!("{} {selected_window}", tray_window_label(window))
         } else {
             selected_window
         };
     }
 
     if show_window_labels {
-        "1w --".to_string()
+        format!("{} --", tray_window_label(None))
     } else {
         "--".to_string()
     }
@@ -696,6 +720,10 @@ mod tests {
                     window_seconds: 604_800,
                     reset_at: None,
                 }),
+                windows: Vec::new(),
+                allowed: None,
+                limit_reached: None,
+                rate_limit_reached_type: None,
                 credits: None,
                 reset_credits: None,
             }),
@@ -736,6 +764,74 @@ mod tests {
         assert!(usage_line.contains("60%"));
         assert!(!usage_line.contains("40%"));
         assert!(!usage_line.contains("5h"));
+    }
+
+
+    #[test]
+    fn one_week_remaining_mode_uses_extra_windows_as_fallback() {
+        let mut account = current_account_with_usage();
+        let usage = account.usage.as_mut().expect("usage");
+        usage.one_week = None;
+        usage.five_hour = None;
+        usage.windows = vec![UsageWindow {
+            used_percent: 40.0,
+            window_seconds: 2_592_000,
+            reset_at: Some(2),
+        }];
+
+        assert_eq!(
+            build_macos_tray_title(
+                std::slice::from_ref(&account),
+                TrayUsageDisplayMode::OneWeekRemaining,
+                false,
+            ),
+            "60%",
+            "30 天窗口应作为主额度展示，而不是 --"
+        );
+    }
+
+    #[test]
+    fn tray_title_labels_the_actual_primary_window() {
+        let mut account = current_account_with_usage();
+        {
+            let usage = account.usage.as_mut().expect("usage");
+            usage.one_week = None;
+            usage.five_hour = None;
+            usage.windows = vec![UsageWindow {
+                used_percent: 40.0,
+                window_seconds: 2_592_000,
+                reset_at: Some(2),
+            }];
+        }
+        assert_eq!(
+            build_macos_tray_title(
+                std::slice::from_ref(&account),
+                TrayUsageDisplayMode::OneWeekRemaining,
+                true,
+            ),
+            "30d 60%",
+            "30 天窗口的标题标签不能写成 1w"
+        );
+
+        let mut five_hour_account = current_account_with_usage();
+        {
+            let usage = five_hour_account.usage.as_mut().expect("usage");
+            usage.one_week = None;
+            usage.windows = Vec::new();
+            usage.five_hour = Some(UsageWindow {
+                used_percent: 25.0,
+                window_seconds: 18_000,
+                reset_at: Some(3),
+            });
+        }
+        assert_eq!(
+            build_macos_tray_title(
+                std::slice::from_ref(&five_hour_account),
+                TrayUsageDisplayMode::OneWeekRemaining,
+                true,
+            ),
+            "5h 75%"
+        );
     }
 
     #[test]

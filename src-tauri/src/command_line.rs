@@ -578,6 +578,15 @@ async fn switch_account(
             }
         }
 
+        // 与 GUI 切换保持一致：先让桌面端退出，再改写 ~/.codex，避免应用在运行中被换身份。
+        crate::stop_desktop_app_if_running()?;
+        // 备份项目状态，并把当前项目清单合并进目标账号快照（只合并、不删除）。
+        if let Some(prepared) = crate::desktop_state::prepare_project_state(
+            &app_paths::app_data_dir_without_tauri()?,
+            &account.auth_json,
+        ) {
+            let _ = prepared;
+        }
         profile_files::sync_account_profile_in_store_path(store_path, account)?;
         profile_files::apply_account_profile(account)?;
         store.settings.active_account_id = Some(account.id.clone());
@@ -878,13 +887,13 @@ fn pick_best_account_index(accounts: &[StoredAccount]) -> Result<usize, String> 
 fn account_rank(account: &StoredAccount) -> (u8, u8, i64, i64) {
     let blocked = u8::from(account.auth_refresh_blocked);
     let has_error = u8::from(account.usage_error.is_some());
-    let one_week = usage_percent_millis(
+    let primary_window = usage_percent_millis(
         account
             .usage
             .as_ref()
-            .and_then(|usage| usage.one_week.as_ref()),
+            .and_then(crate::models::usage_primary_window),
     );
-    (blocked, has_error, one_week, -account.updated_at)
+    (blocked, has_error, primary_window, -account.updated_at)
 }
 
 fn usage_percent_millis(window: Option<&crate::models::UsageWindow>) -> i64 {
@@ -1102,12 +1111,15 @@ fn print_accounts(accounts: &[AccountSummary], json: bool) -> Result<(), String>
             marker,
             utils::short_account(&account.account_id),
             truncate_cell(&account.label, 28),
-            truncate_cell(account.plan_type.as_deref().unwrap_or("-"), 10),
+            truncate_cell(
+                &crate::models::plan_display_zh(account.plan_type.as_deref()),
+                10,
+            ),
             format_window_percent(
                 account
                     .usage
                     .as_ref()
-                    .and_then(|usage| usage.one_week.as_ref())
+                    .and_then(crate::models::usage_primary_window),
             ),
             detail
         );

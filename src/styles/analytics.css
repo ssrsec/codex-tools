@@ -214,6 +214,12 @@
   font: 850 1rem/1.2 var(--font-ui);
 }
 
+.analyticsSessionCount {
+  margin-top: 4px;
+  color: var(--muted);
+  font: 650 0.78rem/1.35 var(--font-ui);
+}
+
 .analyticsSearch {
   max-width: 240px;
 }

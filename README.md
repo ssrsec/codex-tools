@@ -273,6 +273,27 @@ sudo spctl --master-disable
 sudo xattr -r -d com.apple.quarantine /Applications/Codex\ Tools.app
 ```
 
+### 切换账号后 ChatGPT 里的项目分组可能丢失
+
+这是 ChatGPT/Codex 桌面端的已知问题（OpenAI 官方仓库的相关 issue，如 #51477、#54482）：桌面端把本地项目清单按账号保存，切换账号时可能清空项目与会话的归属关系；Codex Tools 在应用运行中切换登录态会放大这条路径，因此本版本改为先退出应用再切换。
+
+从本版本开始，切换账号时工具会：
+
+- 先请求 ChatGPT 桌面端正常退出，确认退出后才改写本机 Codex 登录态；如果应用无法退出，会取消本次切换并提示先手动退出，不会在应用运行中强行切换。首次切换时 macOS 可能弹出“Codex Tools 想要控制 ChatGPT”的自动化授权提示，允许后才能自动退出应用；CLI 的 `ctc switch` 也会先退出桌面端。如果关闭了“切换后启动 Codex 应用”，切换前请先手动退出 ChatGPT；否则工具会取消本次切换并提示先退出，避免在应用运行中切换登录态。
+- 切换前把 `~/.codex/.codex-global-state.json` 备份到本应用数据目录下的 `codex-desktop-state-backups/`，默认保留最近 10 份。
+- 切换前以当前账号的项目清单为来源，把项目、排序、选中项和 app-server 映射同步写入目标账号快照（其它状态不动），让不同账号看到相同的本地项目分组；在一个账号里新增或删除项目，会在下一次切换后同步到其他账号。如果应用版本变化导致状态结构不符，会自动跳过同步并保留备份。
+
+如果仍然发现项目分组丢失，可以按以下步骤手动恢复：
+
+1. 完全退出 ChatGPT（确认进程已结束）。
+2. 关闭 Codex Tools。
+3. 用备份文件覆盖 `~/.codex/.codex-global-state.json`。
+4. 重新打开 ChatGPT，确认项目分组是否恢复。
+
+注意：备份只覆盖项目清单与会话归属所在的 JSON；桌面端数据库（`state_5.sqlite`）不承诺恢复。已经丢失的归属如果没有历史备份，无法由工具自动找回。
+
+以上优雅退出与项目状态备份目前只在 macOS 生效；Windows/Linux 仍按旧逻辑尽力结束进程，且不做项目状态备份。
+
 ### Cursor 无法访问本地地址
 
 如果 Cursor 返回 `ssrf_blocked`，说明它的请求侧无法访问本机私网地址。请使用 cloudflared、远程 Linux 反代或公网域名。

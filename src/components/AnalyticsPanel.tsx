@@ -84,10 +84,28 @@ function formatDuration(seconds: number | null, locale: string) {
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   if (hours <= 0) {
-    return new Intl.NumberFormat(locale).format(minutes) + "m";
+    return `${new Intl.NumberFormat(locale).format(minutes)} 分钟`;
   }
-  return `${new Intl.NumberFormat(locale).format(hours)}h ${minutes}m`;
+  return `${new Intl.NumberFormat(locale).format(hours)} 小时 ${minutes} 分`;
 }
+
+// 中文界面文案：列名/单位不属于多语言字典（避免新增英文键），
+// 统一在这里维护，保证中文界面不再出现英文残留。
+const ANALYTICS_TEXT = {
+  sessionColumn: "会话",
+  tokenColumn: "Token",
+  tokenUnit: "Token",
+  searchSessionPlaceholder: "搜索会话",
+  parentSessionPrefix: "父会话",
+  sessionCountUnit: "个会话",
+  promptCountUnit: "个提示词",
+  eventCountUnit: "个事件",
+  promptCharsUnit: "字符",
+  pricingSourcePrefix: "费率来源",
+  shownSessionsPrefix: "显示前",
+  totalSessionsPrefix: "共",
+  unknownPricingHint: "含未定价模型，成本为估算",
+};
 
 function statCard(
   label: string,
@@ -216,7 +234,8 @@ function ProjectRows({
           <div className="analyticsProjectMetrics">
             <b>{formatUsd(project.costUsd, locale)}</b>
             <small>
-              {formatNumber(project.total.totalTokens, locale)} tokens
+              {formatNumber(project.total.totalTokens, locale)}{" "}
+              {ANALYTICS_TEXT.tokenUnit}
             </small>
           </div>
           <div className="analyticsProjectBar" aria-hidden="true">
@@ -227,8 +246,9 @@ function ProjectRows({
             />
           </div>
           <small>
-            {project.sessionCount} sessions · {project.promptCount} prompts ·{" "}
-            {project.eventCount} events
+            {project.sessionCount} {ANALYTICS_TEXT.sessionCountUnit} ·{" "}
+            {project.promptCount} {ANALYTICS_TEXT.promptCountUnit} ·{" "}
+            {project.eventCount} {ANALYTICS_TEXT.eventCountUnit}
           </small>
         </article>
       ))}
@@ -256,12 +276,12 @@ function SessionTable({
       <table className="analyticsTable">
         <thead>
           <tr>
-            <th>Session</th>
-            <th>Project</th>
-            <th>Model</th>
-            <th>Tokens</th>
-            <th>Cost</th>
-            <th>Updated</th>
+            <th>{ANALYTICS_TEXT.sessionColumn}</th>
+            <th>{text.project}</th>
+            <th>{text.model}</th>
+            <th>{ANALYTICS_TEXT.tokenColumn}</th>
+            <th>{text.cost}</th>
+            <th>{text.updated}</th>
             <th />
           </tr>
         </thead>
@@ -273,7 +293,10 @@ function SessionTable({
                   {session.sessionId.slice(0, 8)}
                 </strong>
                 {session.parentSessionId ? (
-                  <small>parent {session.parentSessionId.slice(0, 8)}</small>
+                  <small>
+                    {ANALYTICS_TEXT.parentSessionPrefix}{" "}
+                    {session.parentSessionId.slice(0, 8)}
+                  </small>
                 ) : null}
               </td>
               <td title={session.projectPath}>{session.projectName}</td>
@@ -326,8 +349,9 @@ function TopPrompts({
             <p title={prompt.promptPreview}>{prompt.promptPreview}</p>
             <span>
               {prompt.projectName} · {prompt.model} ·{" "}
-              {formatNumber(prompt.total.totalTokens, locale)} tokens ·{" "}
-              {prompt.promptChars} chars
+              {formatNumber(prompt.total.totalTokens, locale)}{" "}
+              {ANALYTICS_TEXT.tokenUnit} · {prompt.promptChars}{" "}
+              {ANALYTICS_TEXT.promptCharsUnit}
             </span>
           </div>
         </article>
@@ -421,6 +445,18 @@ export function AnalyticsPanel({
 
   const costSource = costSourceDetail(analytics, text, locale);
   const hasData = analytics !== null && analytics.eventCount > 0;
+  const unknownPricingModels = analytics?.pricingUnknownModels ?? [];
+  const costSourceLabel =
+    unknownPricingModels.length > 0
+      ? `${costSource.label} · ${ANALYTICS_TEXT.unknownPricingHint}`
+      : costSource.label;
+  const showedSessionCount = analytics?.sessions.length ?? 0;
+  const sessionTotal = analytics?.sessionTotal ?? null;
+  // 后端 M5 起返回截断前的会话总数；旧缓存/旧后端缺省时退回旧展示。
+  const sessionsTruncated = sessionTotal !== null && sessionTotal > showedSessionCount;
+  const sessionCountLabel = sessionsTruncated
+    ? `${ANALYTICS_TEXT.shownSessionsPrefix} ${formatNumber(showedSessionCount, locale)} / ${ANALYTICS_TEXT.totalSessionsPrefix} ${formatNumber(sessionTotal ?? 0, locale)}`
+    : null;
   const showProgress = loading || progress !== null;
   const progressPercent = Math.max(
     0,
@@ -498,13 +534,18 @@ export function AnalyticsPanel({
           {statCard(
             text.totalCost,
             analytics ? formatUsd(analytics.totalCostUsd, locale) : "--",
-            costSource.label,
+            costSourceLabel,
+            unknownPricingModels.length > 0
+              ? unknownPricingModels.join("、")
+              : undefined,
           )}
           {statCard(
             text.last7dCost,
             analytics ? formatUsd(analytics.last7dCostUsd, locale) : "--",
-            costSource.label,
-            costSource.title,
+            costSourceLabel,
+            unknownPricingModels.length > 0
+              ? unknownPricingModels.join("、")
+              : costSource.title,
           )}
           {statCard(
             text.totalTokens,
@@ -515,8 +556,12 @@ export function AnalyticsPanel({
           )}
           {statCard(
             text.sessions,
-            analytics ? formatNumber(analytics.sessions.length, locale) : "--",
-            text.sourceFiles,
+            analytics
+              ? formatNumber(sessionTotal ?? showedSessionCount, locale)
+              : "--",
+            sessionsTruncated
+              ? `${ANALYTICS_TEXT.shownSessionsPrefix} ${formatNumber(showedSessionCount, locale)}`
+              : text.sourceFiles,
           )}
         </section>
 
@@ -561,11 +606,14 @@ export function AnalyticsPanel({
                 <div>
                   <h3>{text.sessionsTitle}</h3>
                   <p>{text.sessionsDescription}</p>
+                  {sessionCountLabel ? (
+                    <p className="analyticsSessionCount">{sessionCountLabel}</p>
+                  ) : null}
                 </div>
                 <input
                   className="analyticsSearch"
                   value={sessionQuery}
-                  placeholder="Search sessions"
+                  placeholder={ANALYTICS_TEXT.searchSessionPlaceholder}
                   onChange={(event) => setSessionQuery(event.target.value)}
                 />
               </div>
@@ -612,7 +660,9 @@ export function AnalyticsPanel({
                 {text.usageAnomalies}: {analytics.unresolvedUsageEventCount}
               </span>
             ) : null}
-            <span>{analytics.pricingSource}</span>
+            <span>
+              {ANALYTICS_TEXT.pricingSourcePrefix}：{analytics.pricingSource}
+            </span>
           </footer>
         ) : null}
       </div>

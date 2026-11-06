@@ -217,6 +217,18 @@ pub(crate) struct UsageSnapshot {
     pub(crate) plan_type: Option<String>,
     pub(crate) five_hour: Option<UsageWindow>,
     pub(crate) one_week: Option<UsageWindow>,
+    /// 非 5h/周的标准窗口（如 30 天）。只用于判定与展示，不写入 five_hour/one_week。
+    #[serde(default)]
+    pub(crate) windows: Vec<UsageWindow>,
+    /// 服务端是否允许继续使用（缺失 = 未知，按窗口判断）。
+    #[serde(default)]
+    pub(crate) allowed: Option<bool>,
+    /// 服务端是否已判定触顶（比百分比更权威）。
+    #[serde(default)]
+    pub(crate) limit_reached: Option<bool>,
+    /// 触顶类型对象里的 type 字段（如 workspace_member_credits_depleted）。
+    #[serde(default)]
+    pub(crate) rate_limit_reached_type: Option<String>,
     pub(crate) credits: Option<CreditSnapshot>,
     #[serde(default)]
     pub(crate) reset_credits: Option<ResetCreditsSnapshot>,
@@ -236,20 +248,197 @@ pub(crate) fn plan_type_is_free(plan_type: Option<&str>) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("free"))
 }
 
+/// 归一化 plan slug：trim + 小写；空值 → `unknown`。
+///
+/// 官方枚举（来源：openai/codex 的 plan 枚举）按原值返回；未知值也原样保留，
+/// **不做别名猜测**（避免把上游新增档位或别名误判成已知档位）。
+pub(crate) fn normalize_plan_slug(raw: &str) -> String {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return "unknown".to_string();
+    }
+    // 官方枚举按原值返回；未知值也原样保留（不做别名猜测，避免把上游新增档位误判）。
+    normalized
+}
+
+/// 官方 plan 枚举（来源：openai/codex 的 plan 枚举；用于测试与排查，不做别名映射）。
+#[cfg(test)]
+const OFFICIAL_PLAN_SLUGS: &[&str] = &[
+    "guest",
+    "free",
+    "free_workspace",
+    "go",
+    "plus",
+    "pro",
+    "prolite",
+    "promax",
+    "team",
+    "self_serve_business_prolite",
+    "self_serve_business_usage_based",
+    "business",
+    "ent26",
+    "enterprise_cbp_automation",
+    "enterprise_cbp_usage_based",
+    "enterprise",
+    "education",
+    "edu",
+    "edu_plus",
+    "edu_pro",
+    "quorum",
+    "k12",
+    "sci",
+    "sci_plus",
+    "unknown",
+];
+
+/// Pro 档位/套餐的中文展示名。
+///
+/// 说明：Rust 侧目前没有消费点（前端有独立的 TS 映射），这里先作为唯一事实源沉淀，
+/// 供后续托盘/CLI/通知等 Rust 文案复用，避免各处再写一遍映射。
+#[allow(dead_code)] // 桌面端 CLI/托盘使用；proxyd 独立 crate 不引用。
+pub(crate) fn plan_display_zh(plan: Option<&str>) -> String {
+    let slug = normalize_plan_slug(plan.unwrap_or_default());
+    match slug.as_str() {
+        "prolite" => "Pro 100".to_string(),
+        "pro" => "Pro 200".to_string(),
+        "promax" => "Pro 500".to_string(),
+        "free" => "免费".to_string(),
+        "plus" => "Plus".to_string(),
+        "go" => "Go".to_string(),
+        "team" | "business" => "Business".to_string(),
+        "enterprise" => "Enterprise".to_string(),
+        "edu" | "education" | "edu_plus" | "edu_pro" => "Edu".to_string(),
+        _ => slug,
+    }
+}
+
+/// 账号是否还有可用的 credits：unlimited 视为可用；
+/// 否则要求 has_credits 且余额可解析 > 0。
+pub(crate) fn usage_credits_available(usage: &UsageSnapshot) -> bool {
+    let Some(credits) = usage.credits.as_ref() else {
+        return false;
+    };
+    if credits.unlimited {
+        return true;
+    }
+    if !credits.has_credits {
+        return false;
+    }
+    credits
+        .balance
+        .as_deref()
+        .and_then(parse_credit_balance)
+        .is_some_and(|balance| balance > 0.0)
+}
+
+fn parse_credit_balance(raw: &str) -> Option<f64> {
+    raw.trim()
+        .trim_start_matches('$')
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|balance| balance.is_finite())
+}
+
+fn main_usage_windows(usage: &UsageSnapshot) -> impl Iterator<Item = &UsageWindow> {
+    usage
+        .five_hour
+        .iter()
+        .chain(usage.one_week.iter())
+        .chain(usage.windows.iter())
+}
+
+/// 展示用的主额度窗口：优先周窗口，其次 5h，最后 windows[] 中 window_seconds 最大者。
+///
+/// 用于托盘/CLI 等只展示一个额度的位置；30 天等非标准窗口不写入 one_week，
+/// 但仍应能作为主额度展示，避免显示成 --（两个短横线）。
+#[allow(dead_code)] // 桌面端托盘/CLI 使用；proxyd 独立 crate 不引用。
+pub(crate) fn usage_primary_window(usage: &UsageSnapshot) -> Option<&UsageWindow> {
+    usage
+        .one_week
+        .as_ref()
+        .or(usage.five_hour.as_ref())
+        .or_else(|| {
+            usage
+                .windows
+                .iter()
+                .max_by(|left, right| left.window_seconds.cmp(&right.window_seconds))
+        })
+}
+
+fn usage_window_is_blocking(window: &UsageWindow, usage: &UsageSnapshot, now: i64) -> bool {
+    if !window.used_percent.is_finite() || window.used_percent < 100.0 {
+        return false;
+    }
+    let reset_at = window.reset_at.unwrap_or_else(|| {
+        usage
+            .fetched_at
+            .saturating_add(window.window_seconds.max(0))
+    });
+    reset_at > now
+}
+
+/// 主额度是否处于“被遏制”状态：服务端拒绝、服务端判触顶，或任一主窗口已满且未重置。
+pub(crate) fn usage_included_blocked(usage: &UsageSnapshot, now: i64) -> bool {
+    usage.allowed == Some(false)
+        || usage.limit_reached == Some(true)
+        || main_usage_windows(usage).any(|window| usage_window_is_blocking(window, usage, now))
+}
+
+/// 真值表：
+/// - 服务端明确拒绝（allowed=false）→ 无条件耗尽（credits 也无法绕过）；
+/// - credits 可用（unlimited 或有正余额）→ 不判耗尽；
+/// - 否则按 limit_reached / 任一主窗口满且未重置判断。
+/// 旧快照（allowed/limit_reached 均为 None、windows 为空）自然退化为“只看窗口”。
 pub(crate) fn usage_has_active_exhausted_window(usage: Option<&UsageSnapshot>, now: i64) -> bool {
     let Some(usage) = usage else {
         return false;
     };
 
-    usage.one_week.as_ref().is_some_and(|window| {
-        window.used_percent.is_finite()
-            && window.used_percent >= 100.0
-            && window.reset_at.unwrap_or_else(|| {
+    if usage.allowed == Some(false) {
+        return true;
+    }
+    if usage_credits_available(usage) {
+        return false;
+    }
+    usage_included_blocked(usage, now)
+}
+
+/// 距离恢复可用的最晚重置时间（供反代冷却使用）；未处于遏制状态或没有可用的重置时间时返回 None。
+pub(crate) fn usage_exhaustion_reset_at(usage: Option<&UsageSnapshot>, now: i64) -> Option<i64> {
+    let usage = usage?;
+    if !usage_has_active_exhausted_window(Some(usage), now) {
+        return None;
+    }
+
+    main_usage_windows(usage)
+        .filter(|window| usage_window_is_blocking(window, usage, now))
+        .map(|window| {
+            window.reset_at.unwrap_or_else(|| {
                 usage
                     .fetched_at
                     .saturating_add(window.window_seconds.max(0))
-            }) > now
-    })
+            })
+        })
+        .filter(|reset_at| *reset_at > now)
+        .max()
+}
+
+/// 反代排序用：所有主窗口中最紧的已用百分比（跳过已过期窗口，避免旧快照抬升排序）。
+pub(crate) fn usage_most_constrained_used_percent(
+    usage: Option<&UsageSnapshot>,
+    now: i64,
+) -> Option<f64> {
+    let usage = usage?;
+    main_usage_windows(usage)
+        .filter(|window| match window.reset_at {
+            // reset 未知时保留该窗口（老快照/测试 fixture），避免被误判为已过期而抬高排序。
+            Some(reset_at) => reset_at > now,
+            None => true,
+        })
+        .filter(|window| window.used_percent.is_finite())
+        .map(|window| window.used_percent.clamp(0.0, 100.0))
+        .reduce(f64::max)
 }
 
 pub(crate) fn usage_error_indicates_authorization_failure(error: Option<&str>) -> bool {
@@ -1015,6 +1204,7 @@ fn duplicate_account_merge_score(account: &StoredAccount) -> (u8, u8, u8, u8, i6
 mod tests {
     use super::account_is_eligible_for_automatic_use;
     use super::dedupe_account_variants;
+    use super::OFFICIAL_PLAN_SLUGS;
     use super::mark_current_account_summary;
     use super::usage_error_indicates_authorization_failure;
     use super::AppSettings;
@@ -1041,9 +1231,58 @@ mod tests {
                 window_seconds: 604_800,
                 reset_at: Some(30),
             }),
+            windows: Vec::new(),
+            allowed: None,
+            limit_reached: None,
+            rate_limit_reached_type: None,
             credits: None,
             reset_credits: None,
         }
+    }
+
+    #[test]
+    fn normalize_plan_slug_keeps_official_slugs_and_unknown_values() {
+        for slug in OFFICIAL_PLAN_SLUGS {
+            assert_eq!(
+                super::normalize_plan_slug(slug),
+                *slug,
+                "官方枚举必须原样保留"
+            );
+        }
+        assert_eq!(super::normalize_plan_slug(" PROLITE "), "prolite");
+        assert_eq!(super::normalize_plan_slug("Pro"), "pro");
+        assert_eq!(super::normalize_plan_slug("promax"), "promax");
+        assert_eq!(super::normalize_plan_slug("free_workspace"), "free_workspace");
+        assert_eq!(super::normalize_plan_slug("   "), "unknown");
+        // 未在官方枚举中的值不做别名猜测，保留小写原串。
+        assert_eq!(super::normalize_plan_slug(" pro_5x "), "pro_5x");
+        assert_eq!(super::normalize_plan_slug("Pro_500"), "pro_500");
+    }
+
+    #[test]
+    fn plan_display_zh_maps_pro_tiers_and_common_plans() {
+        assert_eq!(super::plan_display_zh(Some("prolite")), "Pro 100");
+        assert_eq!(super::plan_display_zh(Some("pro")), "Pro 200");
+        assert_eq!(super::plan_display_zh(Some("promax")), "Pro 500");
+        assert_eq!(super::plan_display_zh(Some("free")), "免费");
+        assert_eq!(super::plan_display_zh(Some("plus")), "Plus");
+        assert_eq!(super::plan_display_zh(Some("go")), "Go");
+        assert_eq!(super::plan_display_zh(Some("team")), "Business");
+        assert_eq!(super::plan_display_zh(Some("business")), "Business");
+        assert_eq!(super::plan_display_zh(Some("enterprise")), "Enterprise");
+        assert_eq!(super::plan_display_zh(Some("edu_plus")), "Edu");
+        assert_eq!(super::plan_display_zh(None), "unknown");
+        assert_eq!(super::plan_display_zh(Some("pro_5x")), "pro_5x");
+    }
+
+    #[test]
+    fn variant_key_is_stable_across_plan_case_and_whitespace() {
+        let with_padding = crate::auth::account_variant_key("principal", "account", Some(" PRO "));
+        let canonical = crate::auth::account_variant_key("principal", "account", Some("pro"));
+        let missing = crate::auth::account_variant_key("principal", "account", None);
+
+        assert_eq!(with_padding, canonical);
+        assert_eq!(missing, "principal|account|unknown");
     }
 
     #[test]
@@ -1192,6 +1431,227 @@ mod tests {
 
         assert!(!account_is_eligible_for_automatic_use(&account, 15));
         assert!(account_is_eligible_for_automatic_use(&account, 31));
+    }
+
+
+    fn snapshot_with_windows(
+        five_hour_percent: Option<f64>,
+        one_week_percent: Option<f64>,
+        extra_windows: Vec<UsageWindow>,
+    ) -> UsageSnapshot {
+        UsageSnapshot {
+            fetched_at: 100,
+            plan_type: Some("pro".to_string()),
+            five_hour: five_hour_percent.map(|used_percent| UsageWindow {
+                used_percent,
+                window_seconds: 18_000,
+                reset_at: Some(200),
+            }),
+            one_week: one_week_percent.map(|used_percent| UsageWindow {
+                used_percent,
+                window_seconds: 604_800,
+                reset_at: Some(200),
+            }),
+            windows: extra_windows,
+            allowed: None,
+            limit_reached: None,
+            rate_limit_reached_type: None,
+            credits: None,
+            reset_credits: None,
+        }
+    }
+
+    fn credits_snapshot(has_credits: bool, unlimited: bool, balance: Option<&str>) -> super::CreditSnapshot {
+        super::CreditSnapshot {
+            has_credits,
+            unlimited,
+            balance: balance.map(str::to_string),
+        }
+    }
+
+
+    #[test]
+    fn old_usage_snapshot_without_new_fields_deserializes() {
+        let usage: UsageSnapshot = serde_json::from_value(json!({
+            "fetchedAt": 10,
+            "planType": "pro",
+            "fiveHour": null,
+            "oneWeek": {
+                "usedPercent": 20.0,
+                "windowSeconds": 604800,
+                "resetAt": 30
+            },
+            "credits": null,
+            "resetCredits": null
+        }))
+        .expect("旧 accounts.json 里的 usage 必须能反序列化");
+
+        assert!(usage.windows.is_empty());
+        assert_eq!(usage.allowed, None);
+        assert_eq!(usage.limit_reached, None);
+        assert_eq!(usage.rate_limit_reached_type, None);
+        assert_eq!(
+            usage.one_week.expect("weekly window").used_percent,
+            20.0
+        );
+    }
+
+
+    #[test]
+    fn primary_window_prefers_weekly_then_five_hour_then_longest_extra() {
+        let both_standard = snapshot_with_windows(Some(30.0), Some(40.0), vec![]);
+        assert_eq!(
+            super::usage_primary_window(&both_standard)
+                .expect("primary window")
+                .window_seconds,
+            604_800,
+            "优先周窗口"
+        );
+
+        let five_only = snapshot_with_windows(Some(30.0), None, vec![]);
+        assert_eq!(
+            super::usage_primary_window(&five_only)
+                .expect("primary window")
+                .window_seconds,
+            18_000,
+            "无周窗口时回退 5h"
+        );
+
+        let extra_only = snapshot_with_windows(
+            None,
+            None,
+            vec![
+                UsageWindow {
+                    used_percent: 10.0,
+                    window_seconds: 86_400,
+                    reset_at: Some(500),
+                },
+                UsageWindow {
+                    used_percent: 20.0,
+                    window_seconds: 2_592_000,
+                    reset_at: Some(600),
+                },
+            ],
+        );
+        assert_eq!(
+            super::usage_primary_window(&extra_only)
+                .expect("primary window")
+                .window_seconds,
+            2_592_000,
+            "只有非标准窗口时取最长者（30 天）"
+        );
+        assert!(super::usage_primary_window(&snapshot_with_windows(None, None, vec![])).is_none());
+    }
+
+    #[test]
+    fn exhaustion_truth_table_handles_allowed_limit_reached_and_credits() {
+        // 1) allowed=false：服务端明确拒绝，无条件判耗尽（credits 也无法绕过）。
+        let mut allowed_false = snapshot_with_windows(None, Some(100.0), Vec::new());
+        allowed_false.allowed = Some(false);
+        allowed_false.credits = Some(credits_snapshot(true, false, Some("5.00")));
+        assert!(
+            super::usage_has_active_exhausted_window(Some(&allowed_false), 150),
+            "allowed=false 必须硬阻断，即使 credits 可用"
+        );
+
+        let mut allowed_false_without_credits = snapshot_with_windows(None, Some(10.0), Vec::new());
+        allowed_false_without_credits.allowed = Some(false);
+        assert!(super::usage_has_active_exhausted_window(
+            Some(&allowed_false_without_credits),
+            150
+        ));
+
+        // 2) 任一主窗口 100% 且未重置、无 credits → 耗尽。
+        let weekly_full = snapshot_with_windows(None, Some(100.0), Vec::new());
+        assert!(super::usage_has_active_exhausted_window(Some(&weekly_full), 150));
+
+        // 3) 5h 满、周未满 → 耗尽（两个窗口都要有余量）。
+        let five_full = snapshot_with_windows(Some(100.0), Some(40.0), Vec::new());
+        assert!(super::usage_has_active_exhausted_window(Some(&five_full), 150));
+
+        // 4) 窗口已过重置时间 → 不判耗尽。
+        let mut reset_passed = snapshot_with_windows(None, Some(100.0), Vec::new());
+        reset_passed.one_week.as_mut().expect("weekly").reset_at = Some(120);
+        assert!(!super::usage_has_active_exhausted_window(Some(&reset_passed), 150));
+
+        // 5) has_credits 但余额为 0 → 不可用 credits。
+        let mut zero_balance = snapshot_with_windows(None, Some(100.0), Vec::new());
+        zero_balance.credits = Some(credits_snapshot(true, false, Some("0")));
+        assert!(super::usage_has_active_exhausted_window(Some(&zero_balance), 150));
+
+        // 6) has_credits 但余额不可解析 → 不可用 credits。
+        let mut unparsable_balance = snapshot_with_windows(None, Some(100.0), Vec::new());
+        unparsable_balance.credits = Some(credits_snapshot(true, false, Some("n/a")));
+        assert!(super::usage_has_active_exhausted_window(Some(&unparsable_balance), 150));
+
+        // 7) unlimited=true 视为 credits 可用 → 窗口满也不判耗尽。
+        let mut unlimited = snapshot_with_windows(None, Some(100.0), Vec::new());
+        unlimited.credits = Some(credits_snapshot(true, true, Some("5")));
+        assert!(!super::usage_has_active_exhausted_window(Some(&unlimited), 150));
+
+        let mut unlimited_without_balance =
+            snapshot_with_windows(None, Some(100.0), Vec::new());
+        unlimited_without_balance.credits = Some(credits_snapshot(false, true, None));
+        assert!(!super::usage_has_active_exhausted_window(
+            Some(&unlimited_without_balance),
+            150
+        ));
+
+        // 8) 旧快照（allowed/limit_reached 均为 None）只按窗口判断：无窗口即不判耗尽。
+        assert!(!super::usage_has_active_exhausted_window(
+            Some(&snapshot_with_windows(None, None, Vec::new())),
+            150
+        ));
+
+        // 9) limit_reached=true 比百分比更权威。
+        let mut limit_reached = snapshot_with_windows(None, Some(20.0), Vec::new());
+        limit_reached.limit_reached = Some(true);
+        assert!(super::usage_has_active_exhausted_window(Some(&limit_reached), 150));
+
+        // 10) windows[] 里的 30 天窗口同样参与判定。
+        let month_full = snapshot_with_windows(
+            None,
+            None,
+            vec![UsageWindow {
+                used_percent: 100.0,
+                window_seconds: 2_592_000,
+                reset_at: Some(2_000_000),
+            }],
+        );
+        assert!(super::usage_has_active_exhausted_window(Some(&month_full), 150));
+    }
+
+    #[test]
+    fn exhaustion_reset_at_uses_the_latest_blocking_window() {
+        let mut usage = snapshot_with_windows(Some(100.0), Some(100.0), Vec::new());
+        usage.five_hour.as_mut().expect("five hour").reset_at = Some(300);
+        usage.one_week.as_mut().expect("weekly").reset_at = Some(400);
+
+        assert_eq!(super::usage_exhaustion_reset_at(Some(&usage), 150), Some(400));
+
+        usage.credits = Some(credits_snapshot(true, false, Some("5")));
+        assert_eq!(
+            super::usage_exhaustion_reset_at(Some(&usage), 150),
+            None,
+            "credits 可用时不应产生配额冷却"
+        );
+    }
+
+    #[test]
+    fn most_constrained_used_percent_uses_all_main_windows() {
+        let usage = snapshot_with_windows(Some(90.0), Some(10.0), Vec::new());
+        assert_eq!(
+            super::usage_most_constrained_used_percent(Some(&usage), 150),
+            Some(90.0)
+        );
+
+        let mut reset_passed = snapshot_with_windows(Some(100.0), Some(10.0), Vec::new());
+        reset_passed.five_hour.as_mut().expect("five hour").reset_at = Some(120);
+        assert_eq!(
+            super::usage_most_constrained_used_percent(Some(&reset_passed), 150),
+            Some(10.0),
+            "已过重置时间的旧窗口不参与排序"
+        );
     }
 
     #[test]
@@ -1417,6 +1877,10 @@ mod tests {
                 plan_type: None,
                 five_hour: None,
                 one_week: None,
+                windows: Vec::new(),
+                allowed: None,
+                limit_reached: None,
+                rate_limit_reached_type: None,
                 credits: None,
                 reset_credits: None,
             }),

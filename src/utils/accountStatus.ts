@@ -1,6 +1,11 @@
 import type { AccountSummary, UsageWindow } from "../types/app.ts";
 import { classifyUsageRefreshError } from "./usageRefreshError.ts";
-import { remainingPercent } from "./usage.ts";
+import {
+  mainUsageWindows,
+  planGroup,
+  remainingPercent,
+  usageCreditsAvailable,
+} from "./usage.ts";
 
 export type AccountStatus =
   | "using"
@@ -15,19 +20,25 @@ export function resolvedAccountPlan(account: AccountSummary): string {
 }
 
 export function accountIsFreePlan(account: AccountSummary): boolean {
-  return account.sourceKind === "chatgpt" && resolvedAccountPlan(account) === "free";
+  return (
+    account.sourceKind === "chatgpt" && planGroup(resolvedAccountPlan(account)) === "free"
+  );
 }
 
-function usageWindowIsActivelyExhausted(
-  window: UsageWindow | null | undefined,
+function usageWindowResetAt(window: UsageWindow, fetchedAt: number): number {
+  return window.resetAt ?? fetchedAt + Math.max(0, window.windowSeconds);
+}
+
+function usageWindowIsBlocking(
+  window: UsageWindow,
   fetchedAt: number,
   nowSeconds: number,
 ): boolean {
-  if (!window || !Number.isFinite(window.usedPercent) || window.usedPercent < 100) {
-    return false;
-  }
-  const resetAt = window.resetAt ?? fetchedAt + Math.max(0, window.windowSeconds);
-  return resetAt > nowSeconds;
+  return (
+    Number.isFinite(window.usedPercent) &&
+    window.usedPercent >= 100 &&
+    usageWindowResetAt(window, fetchedAt) > nowSeconds
+  );
 }
 
 function usageWindowIsCurrent(
@@ -38,17 +49,38 @@ function usageWindowIsCurrent(
   if (!window) {
     return false;
   }
-  return (window.resetAt ?? fetchedAt + Math.max(0, window.windowSeconds)) > nowSeconds;
+  return usageWindowResetAt(window, fetchedAt) > nowSeconds;
 }
 
+/**
+ * 与后端 M4 真值表对齐：
+ * included_blocked = allowed === false || limitReached === true ||
+ *   任一主额度窗口（5h/周/windows[]）used >= 100 且未重置
+ * exhausted = included_blocked && !credits 可用
+ * 旧快照（allowed/limitReached 均缺省、windows 为空）自然退化为只看窗口。
+ */
 export function accountHasActiveExhaustedWindow(
   account: AccountSummary,
   nowSeconds = Math.floor(Date.now() / 1000),
 ): boolean {
-  return usageWindowIsActivelyExhausted(
-    account.usage?.oneWeek,
-    account.usage?.fetchedAt ?? nowSeconds,
-    nowSeconds,
+  const usage = account.usage;
+  if (!usage) {
+    return false;
+  }
+  const fetchedAt = usage.fetchedAt ?? nowSeconds;
+  // 服务端明确拒绝时，credits 也无法绕过，直接判耗尽。
+  if (usage.allowed === false) {
+    return true;
+  }
+  // credits 可用（unlimited 或有正余额）时不判耗尽；超出的部分由 credits 支付。
+  if (usageCreditsAvailable(usage)) {
+    return false;
+  }
+  return (
+    usage.limitReached === true ||
+    mainUsageWindows(usage).some((window) =>
+      usageWindowIsBlocking(window, fetchedAt, nowSeconds),
+    )
   );
 }
 
@@ -81,8 +113,9 @@ export function getAccountStatus(
     return "exhausted";
   }
 
-  const fetchedAt = account.usage?.fetchedAt ?? nowSeconds;
-  const remaining = [account.usage?.oneWeek]
+  const usage = account.usage;
+  const fetchedAt = usage?.fetchedAt ?? nowSeconds;
+  const remaining = mainUsageWindows(usage)
     .filter((window) => usageWindowIsCurrent(window, fetchedAt, nowSeconds))
     .map((window) => remainingPercent(window))
     .filter((value): value is number => value !== null && Number.isFinite(value));
@@ -97,10 +130,10 @@ export function accountCanBeCleaned(account: AccountSummary): boolean {
     account.usageError &&
       classifyUsageRefreshError(account.usageError) === "authorization",
   );
-  return (
-    !account.isCurrent &&
-    (account.authRefreshBlocked || authorizationFailure || accountIsFreePlan(account))
-  );
+  // 与后端 M0 口径对齐：只清理“确定性不可用”的账号（授权失效/被停用）。
+  // free 等套餐维度不再参与清理，避免上游误报 free 时误删 Pro 账号；
+  // 套餐只影响可用性展示（accountHasBlockingIssue），不影响删除。
+  return !account.isCurrent && (account.authRefreshBlocked || authorizationFailure);
 }
 
 export function accountIsAvailableForAutomaticUse(

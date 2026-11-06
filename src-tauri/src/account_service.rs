@@ -427,6 +427,11 @@ pub(crate) async fn delete_account_internal(
     Ok(())
 }
 
+fn account_is_definitely_unusable(account: &StoredAccount) -> bool {
+    account.auth_refresh_blocked
+        || usage_error_indicates_authorization_failure(account.usage_error.as_deref())
+}
+
 pub(crate) async fn cleanup_unusable_accounts_internal(
     app: &AppHandle,
     state: &AppState,
@@ -439,10 +444,9 @@ pub(crate) async fn cleanup_unusable_accounts_internal(
     let mut skipped_current_count = 0usize;
 
     store.accounts.retain(|account| {
-        let definitely_unusable = account.auth_refresh_blocked
-            || usage_error_indicates_authorization_failure(account.usage_error.as_deref())
-            || (matches!(account.source_kind, AccountSourceKind::Chatgpt)
-                && plan_type_is_free(account.resolved_plan_type().as_deref()));
+        // 只清理“确定性不可用”的账号（授权失效/被停用）。套餐（plan_type）是账号状态而不是身份，
+        // 且上游存在把 Pro 误报为 free 的先例，不能作为删除依据。
+        let definitely_unusable = account_is_definitely_unusable(account);
         if !definitely_unusable {
             return true;
         }
@@ -1467,7 +1471,9 @@ fn should_retry_with_token_refresh(
     fetch_result: &Result<crate::models::UsageSnapshot, String>,
 ) -> bool {
     match fetch_result {
-        Ok(snapshot) => snapshot.plan_type.is_none(),
+        // 抓取成功但 plan_type 缺失不再触发 token 刷新：30s 轮询会持续轮换 refresh_token，
+        // 放大 refresh_token_reused 与多进程互踢风险。只在明确的鉴权失败（Err 分支）重试。
+        Ok(_) => false,
         Err(err) => {
             let normalized = err.to_ascii_lowercase();
             normalized.contains("401")
@@ -2158,6 +2164,7 @@ fn normalize_import_source(source: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::account_is_definitely_unusable;
     use super::expand_import_json_content;
     use super::is_stale_refresh_snapshot_error;
     use super::keepalive_max_last_refresh_age_secs;
@@ -2237,6 +2244,10 @@ mod tests {
                 window_seconds: 604_800,
                 reset_at: Some(30),
             }),
+            windows: Vec::new(),
+            allowed: None,
+            limit_reached: None,
+            rate_limit_reached_type: None,
             credits: None,
             reset_credits: None,
         }
@@ -2257,6 +2268,10 @@ mod tests {
             plan_type: None,
             five_hour: None,
             one_week: None,
+            windows: Vec::new(),
+            allowed: None,
+            limit_reached: None,
+            rate_limit_reached_type: None,
             credits: None,
             reset_credits: None,
         };
@@ -2688,6 +2703,98 @@ mod tests {
         );
 
         assert!(should_retry_with_token_refresh(&fetch_result));
+    }
+
+
+    fn cleanup_account(
+        plan_type: Option<&str>,
+        usage_plan: Option<&str>,
+        usage_error: Option<&str>,
+        auth_refresh_blocked: bool,
+    ) -> StoredAccount {
+        StoredAccount {
+            id: "cleanup-account".to_string(),
+            label: "cleanup".to_string(),
+            source_kind: Default::default(),
+            principal_id: Some("cleanup@example.com".to_string()),
+            email: Some("cleanup@example.com".to_string()),
+            account_id: "cleanup-account".to_string(),
+            plan_type: plan_type.map(str::to_string),
+            auth_json: json!({ "kind": "cleanup" }),
+            api_base_url: None,
+            api_key: None,
+            model_name: None,
+            balance_text: None,
+            profile_auth_path: None,
+            profile_config_path: None,
+            profile_auth_ready: false,
+            profile_config_ready: false,
+            profile_integrity_error: None,
+            profile_last_validated_at: None,
+            profile_last_validation_error: None,
+            added_at: 1,
+            updated_at: 1,
+            usage: usage_plan.map(usage_snapshot),
+            usage_error: usage_error.map(str::to_string),
+            auth_refresh_blocked,
+            auth_refresh_error: None,
+            api_proxy_enabled: true,
+        }
+    }
+
+    #[test]
+    fn cleanup_does_not_delete_free_or_misreported_free_accounts() {
+        let free = cleanup_account(Some("free"), Some("free"), None, false);
+        assert!(!account_is_definitely_unusable(&free), "free 不再自动删除");
+
+        let misreported_pro = cleanup_account(Some("pro"), Some("free"), None, false);
+        assert!(
+            !account_is_definitely_unusable(&misreported_pro),
+            "上游把 Pro 误报为 free 时也不能删除账号"
+        );
+
+        let pro_without_usage = cleanup_account(Some("pro"), None, None, false);
+        assert!(!account_is_definitely_unusable(&pro_without_usage));
+    }
+
+    #[test]
+    fn cleanup_still_deletes_authorization_failures() {
+        let blocked = cleanup_account(Some("pro"), None, None, true);
+        assert!(account_is_definitely_unusable(&blocked));
+
+        let forbidden = cleanup_account(Some("pro"), None, Some("403 Forbidden"), false);
+        assert!(account_is_definitely_unusable(&forbidden));
+
+        let transient = cleanup_account(Some("pro"), None, Some("503 Service Unavailable"), false);
+        assert!(
+            !account_is_definitely_unusable(&transient),
+            "瞬时错误不应删除账号"
+        );
+    }
+
+    #[test]
+    fn plan_type_missing_does_not_retry_token_refresh() {
+        let mut snapshot = usage_snapshot("pro");
+        snapshot.plan_type = None;
+        let ok_without_plan: Result<UsageSnapshot, String> = Ok(snapshot);
+
+        assert!(!should_retry_with_token_refresh(&ok_without_plan));
+
+        let unauthorized = Err("请求用量接口失败: 401 Unauthorized".to_string());
+        assert!(should_retry_with_token_refresh(&unauthorized));
+    }
+
+
+    #[test]
+    fn membership_refresh_ignores_plan_case_and_whitespace() {
+        let now = 2_000_000_000;
+        let auth_json = membership_auth_json(" PRO ", now + 30 * 24 * 60 * 60, now - 901);
+
+        assert!(!should_refresh_membership_auth(
+            &auth_json,
+            Some("pro"),
+            now
+        ));
     }
 
     #[test]

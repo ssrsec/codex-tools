@@ -4,6 +4,7 @@ mod auth;
 mod cli;
 mod cloudflared_service;
 mod command_line;
+mod desktop_state;
 mod editor_apps;
 mod i18n;
 mod models;
@@ -1315,6 +1316,18 @@ mod tests {
     }
 
     #[test]
+    fn macos_graceful_quit_timeout_prefers_longer_wait_when_quit_was_accepted() {
+        assert_eq!(
+            super::macos_graceful_quit_timeout(true),
+            std::time::Duration::from_secs(6)
+        );
+        assert_eq!(
+            super::macos_graceful_quit_timeout(false),
+            std::time::Duration::from_secs(3)
+        );
+    }
+
+    #[test]
     fn build_oauth_callback_url_uses_redirect_origin_and_runtime_query() {
         let callback_url = build_oauth_callback_url(
             "http://localhost:17888/auth/callback",
@@ -1577,6 +1590,7 @@ async fn switch_account_and_launch(
     restart_editors_on_switch: Option<bool>,
     restart_editor_targets: Option<Vec<EditorAppId>>,
 ) -> Result<SwitchAccountResult, String> {
+    let should_launch_codex = launch_codex.unwrap_or(true);
     let (
         account,
         should_sync_opencode,
@@ -1614,6 +1628,38 @@ async fn switch_account_and_launch(
                 .err()
                 .map(|error| format!("同步 Codex 历史 provider 元数据失败: {error}"));
             return Ok(result);
+        }
+
+        // 先让桌面端退出，再改写 auth/config，避免应用在运行中被“换身份”。
+        // 放在刷新 token 之前：若退出失败会直接返回，此时既没有写盘，也没有轮换 refresh token，
+        // 属于真正的零副作用中止。
+        if should_launch_codex {
+            let quit_outcome = tauri::async_runtime::spawn_blocking(stop_desktop_app_if_running)
+                .await
+                .map_err(|error| format!("停止 ChatGPT 桌面端任务失败: {error}"))??;
+            log::info!("切换账号前停止 ChatGPT/Codex 桌面端: {quit_outcome:?}");
+        } else if desktop_app_is_running() {
+            return Err(
+                "ChatGPT 桌面端正在运行，已取消本次切换。请先退出 ChatGPT，或在设置中开启“切换后启动 Codex 应用”后重试。"
+                    .to_string(),
+            );
+        }
+
+        if let Some(prepared) = desktop_state::prepare_project_state(
+            &app_paths::app_data_dir(&app)?,
+            &account.auth_json,
+        ) {
+            log::info!(
+                "切换前已备份 ChatGPT 项目状态: {}（目标账号快照 {}，项目清单同步: {}，项目数: {}）",
+                prepared.backup_path.display(),
+                prepared
+                    .target_hash
+                    .as_deref()
+                    .map(|hash| &hash[..hash.len().min(12)])
+                    .unwrap_or("unknown"),
+                prepared.seeded,
+                prepared.seeded_projects
+            );
         }
 
         if matches!(account.source_kind, models::AccountSourceKind::Chatgpt) {
@@ -1697,6 +1743,7 @@ async fn switch_account_and_launch(
             restart_editor_targets.unwrap_or_else(|| store.settings.restart_editor_targets.clone());
         let configured_codex_launch_path = store.settings.codex_launch_path.clone();
         let launch_codex_as_admin = store.settings.launch_codex_as_admin;
+
         {
             let _guard = state.store_lock.lock().await;
             let mut latest_store = store::load_store(&app)?;
@@ -1733,10 +1780,6 @@ async fn switch_account_and_launch(
         )
     };
 
-    let should_launch_codex = launch_codex.unwrap_or(true);
-    if should_launch_codex {
-        force_stop_running_codex()?;
-    }
     let provider_sync_error = provider_sync::sync_current_provider(None)
         .err()
         .map(|error| format!("同步 Codex 历史 provider 元数据失败: {error}"));
@@ -2001,7 +2044,9 @@ fn launch_codex_app(
     {
         let _ = launch_as_admin;
         let mut cmd = Command::new("open");
-        cmd.arg("-na").arg(path);
+        // 应用已在前一步退出；这里直接打开 app bundle（不带 -n），
+        // 旧实例若意外仍在则只会被激活，不会产生第二个实例。
+        cmd.arg(path);
         if let Some(workspace) = workspace_path {
             cmd.arg(workspace);
         }
@@ -2346,6 +2391,7 @@ fn collect_descendant_process_ids(
 }
 
 #[cfg(target_os = "macos")]
+#[cfg_attr(test, allow(dead_code))]
 fn running_macos_codex_desktop_process_ids(
     system: &sysinfo::System,
     current_user_id: &sysinfo::Uid,
@@ -2372,56 +2418,193 @@ fn running_macos_codex_desktop_process_ids(
     collect_descendant_process_ids(desktop_roots, &process_parents)
 }
 
-#[cfg(target_os = "macos")]
-fn stop_running_macos_codex_processes() -> Result<(), String> {
-    let mut system = sysinfo::System::new_all();
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) enum DesktopQuitOutcome {
+    NotRunning,
+    Graceful { waited_ms: u64 },
+    Terminated { waited_ms: u64 },
+    LegacyStopped,
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn desktop_app_is_running() -> bool {
+    match macos_running_desktop_process_ids() {
+        Ok(running) => !running.is_empty(),
+        Err(error) => {
+            // 识别失败时保守返回 false：宁可继续切换，也不因为一次枚举失败永久拦住用户。
+            log::warn!("检查 ChatGPT/Codex 桌面端进程失败: {error}");
+            false
+        }
+    }
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn desktop_app_is_running() -> bool {
+    false
+}
+
+/// 在切换账号前让 ChatGPT/Codex 桌面端退出。
+///
+/// 顺序：AppleScript quit -> 轮询等待 -> SIGTERM -> 再等待；仍不退出则返回错误，由调用方零副作用中止。
+/// 关键点：这里绝不再使用 SIGKILL，也不在应用仍运行时改写 ~/.codex。
+#[cfg(all(target_os = "macos", not(test)))]
+pub(crate) fn stop_desktop_app_if_running() -> Result<DesktopQuitOutcome, String> {
+    stop_running_macos_codex_processes_gracefully()
+}
+
+#[cfg(all(not(target_os = "macos"), not(test)))]
+pub(crate) fn stop_desktop_app_if_running() -> Result<DesktopQuitOutcome, String> {
+    force_stop_running_codex()?;
+    Ok(DesktopQuitOutcome::LegacyStopped)
+}
+
+#[cfg(test)]
+pub(crate) fn stop_desktop_app_if_running() -> Result<DesktopQuitOutcome, String> {
+    Ok(DesktopQuitOutcome::NotRunning)
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn macos_running_desktop_process_ids() -> Result<HashSet<sysinfo::Pid>, String> {
+    let system = sysinfo::System::new_all();
     let current_pid = sysinfo::get_current_pid().map_err(|error| error.to_string())?;
     let current_user_id = system
         .process(current_pid)
         .and_then(|process| process.user_id())
         .cloned()
         .ok_or_else(|| "无法识别当前用户，未结束 ChatGPT/Codex 应用进程".to_string())?;
-    let mut remaining = running_macos_codex_desktop_process_ids(&system, &current_user_id);
-    if remaining.is_empty() {
-        return Ok(());
-    }
+    Ok(running_macos_codex_desktop_process_ids(
+        &system,
+        &current_user_id,
+    ))
+}
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+#[cfg(all(target_os = "macos", not(test)))]
+fn request_macos_desktop_quit() -> bool {
+    const QUIT_SCRIPT: &str = "tell application id \"com.openai.codex\" to quit";
+    let mut child = match Command::new("osascript")
+        .arg("-e")
+        .arg(QUIT_SCRIPT)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            log::warn!("请求 ChatGPT 退出失败（无法启动 osascript）: {error}");
+            return false;
+        }
+    };
+
+    // 首次使用时 macOS 会弹出自动化授权提示；限时等待，超时后回退到 SIGTERM 路径。
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
-        // 按已验证 App bundle 的可执行路径结束整个进程树，避免裸进程名误杀普通 ChatGPT。
-        for pid in &remaining {
-            if let Some(process) = system.process(*pid) {
-                let _ = process.kill();
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    log::warn!("请求 ChatGPT 退出返回非零状态: {status}");
+                }
+                return status.success();
             }
-        }
-
-        thread::sleep(Duration::from_millis(50));
-        system.refresh_processes();
-        remaining.retain(|pid| system.process(*pid).is_some());
-        remaining.extend(running_macos_codex_desktop_process_ids(
-            &system,
-            &current_user_id,
-        ));
-        if remaining.is_empty() {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            let pids = remaining
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!("无法结束正在运行的 ChatGPT/Codex 应用进程: {pids}"));
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    log::warn!("请求 ChatGPT 退出超时（3 秒），继续等待应用自行退出");
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                log::warn!("等待 osascript 退出时出错: {error}");
+                return false;
+            }
         }
     }
 }
 
-fn force_stop_running_codex() -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        stop_running_macos_codex_processes()?;
+#[cfg(any(target_os = "macos", test))]
+fn macos_graceful_quit_timeout(quit_requested: bool) -> Duration {
+    // 应用已接受退出请求时多给一些收尾时间，避免过早升级到 SIGTERM 打断落盘。
+    if quit_requested {
+        Duration::from_secs(6)
+    } else {
+        Duration::from_secs(3)
+    }
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn wait_for_macos_desktop_exit(timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match macos_running_desktop_process_ids() {
+            Ok(running) if running.is_empty() => return true,
+            Ok(_) => {}
+            Err(error) => {
+                log::warn!("检查 ChatGPT 进程失败: {error}");
+                return false;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn terminate_macos_desktop_processes(signal: sysinfo::Signal) {
+    let system = sysinfo::System::new_all();
+    let Ok(current_pid) = sysinfo::get_current_pid() else {
+        return;
+    };
+    let Some(current_user_id) = system
+        .process(current_pid)
+        .and_then(|process| process.user_id())
+        .cloned()
+    else {
+        return;
+    };
+    for pid in running_macos_codex_desktop_process_ids(&system, &current_user_id) {
+        if let Some(process) = system.process(pid) {
+            let _ = process.kill_with(signal);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn stop_running_macos_codex_processes_gracefully() -> Result<DesktopQuitOutcome, String> {
+    if macos_running_desktop_process_ids()?.is_empty() {
+        return Ok(DesktopQuitOutcome::NotRunning);
     }
 
+    let started_at = std::time::Instant::now();
+    let quit_requested = request_macos_desktop_quit();
+    if wait_for_macos_desktop_exit(macos_graceful_quit_timeout(quit_requested)) {
+        return Ok(DesktopQuitOutcome::Graceful {
+            waited_ms: started_at.elapsed().as_millis() as u64,
+        });
+    }
+
+    // SIGTERM 仍给 Electron 一次正常收尾的机会，但不再使用 SIGKILL。
+    terminate_macos_desktop_processes(sysinfo::Signal::Term);
+    if wait_for_macos_desktop_exit(Duration::from_secs(2)) {
+        return Ok(DesktopQuitOutcome::Terminated {
+            waited_ms: started_at.elapsed().as_millis() as u64,
+        });
+    }
+
+    Err(format!(
+        "ChatGPT 桌面端仍在运行，已取消本次切换（已等待 {} 秒）。请手动退出 ChatGPT 后重试。",
+        started_at.elapsed().as_secs()
+    ))
+}
+
+/// 非 macOS 平台的兜底停止逻辑（旧行为，保持不变）。
+///
+/// macOS 已改走 `stop_desktop_app_if_running` 的优雅退出路径；Windows/Linux
+/// 仍使用系统强杀（taskkill /F、pkill -9），因为这两个平台的桌面端进程识别
+/// 与优雅退出未做等价改造。存在未保存状态丢失的可能，文档中已注明。
+#[allow(dead_code)]
+fn force_stop_running_codex() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         let _ = new_background_command("taskkill")
