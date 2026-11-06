@@ -119,6 +119,8 @@ const CODEX_USER_AGENT: &str = "codex_cli_rs/0.159.0";
 const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 const ANTHROPIC_MESSAGES_REQUIRED_VERSION: &str = "2023-06-01";
 const SSE_DONE: &str = "data: [DONE]\n\n";
+// Controller model for the legacy Responses image tool path (Relay accounts).
+// ChatGPT accounts use the native Images endpoints and never send this model.
 const DEFAULT_IMAGE_CONTROLLER_MODEL: &str = "gpt-5.5";
 const DEFAULT_IMAGE_TOOL_MODEL: &str = "gpt-image-2";
 const DEFAULT_UPSTREAM_SERVICE_TIER: &str = "default";
@@ -224,6 +226,7 @@ pub(crate) struct ProxyStorageContext {
 struct ProxyCandidate {
     id: String,
     label: String,
+    source_kind: AccountSourceKind,
     account_key: String,
     account_id: String,
     access_token: String,
@@ -1153,6 +1156,7 @@ async fn chat_completions_handler(
         &context,
         &proxy_key,
         "/v1/chat/completions",
+        None,
         &headers,
         &mut upstream_payload,
         session_affinity_key.as_deref(),
@@ -1234,6 +1238,7 @@ async fn responses_handler(
         &context,
         &proxy_key,
         "/v1/responses",
+        None,
         &headers,
         &mut upstream_payload,
         session_affinity_key.as_deref(),
@@ -1311,6 +1316,7 @@ async fn anthropic_messages_handler(
         &context,
         &proxy_key,
         "/v1/messages",
+        None,
         &headers,
         &mut upstream_payload,
         session_affinity_key.as_deref(),
@@ -1474,11 +1480,13 @@ async fn forward_image_request(
         downstream_stream,
         image_count,
     } = image_request;
+    let image_transport = ImageTransportKind::from_route(route);
 
     let upstream = match send_codex_request_over_candidates(
         &context,
         &proxy_key,
         route,
+        Some(image_transport),
         &headers,
         &mut upstream_payload,
         session_affinity_key,
@@ -1495,7 +1503,19 @@ async fn forward_image_request(
     let usage_metadata = api_proxy_usage_metadata(&proxy_key, &candidate, route, &upstream_payload);
 
     if downstream_stream {
-        build_image_streaming_response(upstream_response, context.storage.clone(), usage_metadata)
+        if matches!(candidate.source_kind, AccountSourceKind::Chatgpt) {
+            build_native_image_streaming_response(
+                upstream_response,
+                context.storage.clone(),
+                usage_metadata,
+            )
+        } else {
+            build_image_streaming_response(
+                upstream_response,
+                context.storage.clone(),
+                usage_metadata,
+            )
+        }
     } else {
         let mut upstream_headers = HeaderMap::new();
         let mut created = now_unix_seconds();
@@ -1512,6 +1532,7 @@ async fn forward_image_request(
                     &context,
                     &proxy_key,
                     route,
+                    Some(image_transport),
                     &headers,
                     &mut upstream_payload,
                     session_affinity_key,
@@ -1537,7 +1558,12 @@ async fn forward_image_request(
             };
             upstream_headers = headers;
 
-            let completed = match extract_completed_response_from_sse(&upstream_body) {
+            let native_images = matches!(candidate.source_kind, AccountSourceKind::Chatgpt);
+            let completed = match if native_images {
+                parse_native_image_response(&upstream_body)
+            } else {
+                extract_completed_response_from_sse(&upstream_body)
+            } {
                 Ok(value) => value,
                 Err(message) => {
                     update_proxy_error(&context, Some(message.clone())).await;
@@ -1548,7 +1574,11 @@ async fn forward_image_request(
                 api_proxy_usage_metadata(&proxy_key, &candidate, route, &upstream_payload);
             record_api_proxy_tokens_from_response(&context.storage, &usage_metadata, &completed)
                 .await;
-            let converted = match convert_responses_image_output_to_images_response(&completed) {
+            let converted = match if native_images {
+                Ok(completed)
+            } else {
+                convert_responses_image_output_to_images_response(&completed)
+            } {
                 Ok(value) => value,
                 Err(message) => {
                     update_proxy_error(&context, Some(message.clone())).await;
@@ -1648,6 +1678,7 @@ async fn handle_responses_websocket(
         &context,
         &proxy_key,
         "/v1/responses websocket",
+        None,
         &headers,
         &mut upstream_payload,
         session_affinity_key.as_deref(),
@@ -2602,6 +2633,37 @@ struct ConvertedImageRequest {
     image_count: usize,
 }
 
+// ChatGPT accounts use Codex's native Images endpoints instead of the
+// (retired) Responses image-generation tool controller. Relay accounts keep
+// the Responses tool path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageTransportKind {
+    Generation,
+    Edit,
+}
+
+impl ImageTransportKind {
+    fn from_route(route: &str) -> Self {
+        match route {
+            "/v1/images/generations" => Self::Generation,
+            _ => Self::Edit,
+        }
+    }
+
+    fn endpoint_path(self) -> &'static str {
+        match self {
+            Self::Generation => "images/generations",
+            Self::Edit => "images/edits",
+        }
+    }
+}
+
+fn all_candidates_are_chatgpt(candidates: &[ProxyCandidate]) -> bool {
+    candidates
+        .iter()
+        .all(|candidate| matches!(candidate.source_kind, AccountSourceKind::Chatgpt))
+}
+
 async fn parse_image_multipart_request(
     mut multipart: Multipart,
 ) -> Result<ImageMultipartRequest, String> {
@@ -2895,6 +2957,144 @@ fn mask_as_input_image(mut mask: Value) -> Value {
         object.insert("type".to_string(), Value::String("input_image".to_string()));
     }
     mask
+}
+
+// Convert the Responses-shaped image payload built by
+// `convert_image_request_parts_to_codex` into the native Codex Images request
+// body: the image model itself is the top-level model, the proxy owns the
+// n-image loop, and unsupported options fail loudly instead of being dropped.
+fn native_image_payload(payload: &Value) -> Result<Value, String> {
+    let tools = payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "图片请求缺少 image_generation 工具".to_string())?;
+    let tool = match tools.as_slice() {
+        [tool] if tool.get("type").and_then(Value::as_str) == Some("image_generation") => tool,
+        _ => return Err("原生图片请求必须包含且仅包含一个 image_generation 工具".to_string()),
+    };
+    let model = tool
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| "图片请求缺少图片模型".to_string())?;
+
+    if let Some(format) = tool.get("output_format") {
+        if format.as_str() != Some("png") {
+            return Err(
+                "ChatGPT 原生图片接口暂只支持 PNG 输出；请省略 output_format 或设为 png"
+                    .to_string(),
+            );
+        }
+    }
+    if tool.get("output_compression").is_some() {
+        return Err("ChatGPT 原生图片接口暂不支持 output_compression/compression 参数".to_string());
+    }
+    if let Some(fidelity) = tool.get("input_fidelity") {
+        if fidelity.as_str() != Some("high") {
+            return Err(
+                "ChatGPT 原生图片接口暂不支持自定义 input_fidelity；请省略该参数或设为 high"
+                    .to_string(),
+            );
+        }
+    }
+
+    let input = payload
+        .get("input")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "图片请求缺少 input 数组".to_string())?;
+    let mut text = Vec::new();
+    let mut images = Vec::new();
+    for message in input {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(content) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in content {
+            match item.get("type").and_then(Value::as_str) {
+                Some("input_text") => {
+                    if let Some(value) = item.get("text").and_then(Value::as_str) {
+                        text.push(value);
+                    }
+                }
+                Some("input_image") => {
+                    let mut image = Map::new();
+                    for key in ["image_url", "file_id"] {
+                        if let Some(value) = item
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                        {
+                            image.insert(key.to_string(), Value::String(value.to_string()));
+                        }
+                    }
+                    if image.len() != 1 {
+                        return Err(
+                            "原生图片编辑的每张图片必须提供一个 image_url 或 file_id".to_string()
+                        );
+                    }
+                    images.push(Value::Object(image));
+                }
+                _ => {}
+            }
+        }
+    }
+    let prompt = text.join("\n\n");
+    if prompt.trim().is_empty() {
+        return Err("图片请求缺少非空提示词".to_string());
+    }
+
+    let mut request = Map::new();
+    request.insert("model".to_string(), Value::String(model.to_string()));
+    request.insert("prompt".to_string(), Value::String(prompt));
+    // The proxy owns the n-image loop so a candidate retry cannot multiply n.
+    request.insert("n".to_string(), json!(1));
+    for key in ["size", "quality", "background"] {
+        if let Some(value) = tool.get(key) {
+            request.insert(key.to_string(), value.clone());
+        }
+    }
+    if !images.is_empty() {
+        request.insert("images".to_string(), Value::Array(images));
+    }
+    // Accepted PNG/high compatibility values need no native request fields.
+    // partial_images is omitted: this API returns JSON, not streamed previews.
+    Ok(Value::Object(request))
+}
+
+fn validate_native_image_response(response: &Value) -> Result<(), String> {
+    let data = response
+        .get("data")
+        .and_then(Value::as_array)
+        .filter(|data| !data.is_empty())
+        .ok_or_else(|| "Codex 原生图片响应中没有图片数据 data".to_string())?;
+    if data.iter().any(|item| {
+        item.get("b64_json")
+            .and_then(Value::as_str)
+            .map_or(true, |value| value.trim().is_empty())
+    }) {
+        return Err("Codex 原生图片响应包含缺失或为空的 b64_json".to_string());
+    }
+    Ok(())
+}
+
+fn parse_native_image_response(body: &[u8]) -> Result<Value, String> {
+    let response: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("解析 Codex 图片 JSON 响应失败: {error}"))?;
+    if let Some(message) = response
+        .pointer("/error/message")
+        .or_else(|| response.get("detail"))
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+    {
+        return Err(message.to_string());
+    }
+    if let Some(message) = response_error_message_from_value(&response) {
+        return Err(message);
+    }
+    validate_native_image_response(&response)?;
+    Ok(response)
 }
 
 fn convert_responses_image_output_to_images_response(response: &Value) -> Result<Value, String> {
@@ -4163,6 +4363,7 @@ async fn send_codex_request_over_candidates(
     context: &ProxyContext,
     proxy_key: &ApiProxyKey,
     route: &str,
+    image_transport: Option<ImageTransportKind>,
     headers: &HeaderMap,
     payload: &mut Value,
     session_affinity_key: Option<&str>,
@@ -4182,6 +4383,22 @@ async fn send_codex_request_over_candidates(
     if let Err(message) = ensure_api_proxy_key_allows_payload(proxy_key, payload) {
         update_proxy_error(context, Some(message.clone())).await;
         return Err(json_error_response(StatusCode::FORBIDDEN, &message));
+    }
+    if image_transport.is_some() {
+        // Image requests are validated after the model/Key policy checks and
+        // before any candidate attempt: a malformed image payload is a client
+        // error and must not cool down accounts or rotate the candidate pool.
+        // Relay accounts are not served by the native transport yet; reject a
+        // mixed pool explicitly instead of silently applying the wrong path.
+        if !all_candidates_are_chatgpt(&selection.candidates) {
+            return Err(json_error_response(
+                StatusCode::BAD_REQUEST,
+                "当前图片原生传输仅支持全部为 ChatGPT 账号的候选池；混合候选池暂不支持。",
+            ));
+        }
+        if let Err(message) = native_image_payload(payload) {
+            return Err(invalid_request_response(&message));
+        }
     }
     if selection.candidates.is_empty() {
         return Err(json_error_response(
@@ -4224,23 +4441,28 @@ async fn send_codex_request_over_candidates(
 
         loop {
             log_proxy_request_route(route);
-            let upstream =
-                match forward_codex_request_with_candidate(context, &candidate, headers, payload)
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(error) => {
-                        record_proxy_transport_failure(
-                            context,
-                            &candidate.account_key,
-                            now_unix_seconds(),
-                            &error,
-                        )
-                        .await;
-                        attempt_errors.push(format!("{}: {}", candidate.label, error));
-                        break;
-                    }
-                };
+            let upstream = match forward_codex_request_with_candidate(
+                context,
+                &candidate,
+                image_transport,
+                headers,
+                payload,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    record_proxy_transport_failure(
+                        context,
+                        &candidate.account_key,
+                        now_unix_seconds(),
+                        &error,
+                    )
+                    .await;
+                    attempt_errors.push(format!("{}: {}", candidate.label, error));
+                    break;
+                }
+            };
 
             let status = upstream.status();
             log_proxy_response_route(route, status);
@@ -4365,14 +4587,72 @@ async fn send_codex_request_over_candidates(
     Err(json_error_response(StatusCode::BAD_GATEWAY, &merged_error))
 }
 
+// Shared Codex upstream headers. Native Images requests use the same header set
+// as regular Responses requests, except for Accept (JSON instead of SSE) and the
+// extra x-codex-image-turn-id header added by the caller.
+fn codex_upstream_header_pairs(
+    candidate: &ProxyCandidate,
+    version: &str,
+    user_agent: &str,
+    session_id: &str,
+    accept: &str,
+) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "Authorization",
+            format!("Bearer {}", candidate.access_token),
+        ),
+        ("ChatGPT-Account-Id", candidate.account_id.clone()),
+        ("Accept", accept.to_string()),
+        ("Content-Type", "application/json".to_string()),
+        ("Originator", "codex_cli_rs".to_string()),
+        ("Version", version.to_string()),
+        ("Session_id", session_id.to_string()),
+        ("User-Agent", user_agent.to_string()),
+        ("Connection", "Keep-Alive".to_string()),
+    ]
+}
+
+fn build_codex_upstream_request(
+    context: &ProxyContext,
+    candidate: &ProxyCandidate,
+    upstream_url: &str,
+    version: &str,
+    user_agent: &str,
+    session_id: &str,
+    accept: &str,
+) -> reqwest::RequestBuilder {
+    let mut request = context.client.post(upstream_url);
+    for (name, value) in
+        codex_upstream_header_pairs(candidate, version, user_agent, session_id, accept)
+    {
+        request = request.header(name, value);
+    }
+    request
+}
+
 async fn forward_codex_request_with_candidate(
     context: &ProxyContext,
     candidate: &ProxyCandidate,
+    image_transport: Option<ImageTransportKind>,
     headers: &HeaderMap,
     payload: &Value,
 ) -> Result<CodexUpstreamResponse, String> {
-    let upstream_url = format!("{}/responses", context.upstream_base_url);
-    let upstream_payload = payload_for_upstream(payload);
+    // ChatGPT accounts use the native Images endpoints; Relay accounts keep the
+    // Responses image-generation tool path.
+    let native_image =
+        image_transport.is_some() && matches!(candidate.source_kind, AccountSourceKind::Chatgpt);
+    let upstream_url = match image_transport {
+        Some(kind) if native_image => {
+            format!("{}/{}", context.upstream_base_url, kind.endpoint_path())
+        }
+        _ => format!("{}/responses", context.upstream_base_url),
+    };
+    let upstream_payload = if native_image {
+        native_image_payload(payload)?
+    } else {
+        payload_for_upstream(payload)
+    };
     let session_id = headers
         .get("session_id")
         .and_then(|value| value.to_str().ok())
@@ -4383,7 +4663,7 @@ async fn forward_codex_request_with_candidate(
     let uses_responses_lite = payload_uses_responses_lite(&upstream_payload);
     let (version, user_agent) = upstream_codex_client_identity(headers, uses_responses_lite);
 
-    if should_use_responses_websocket(&upstream_payload) {
+    if !native_image && should_use_responses_websocket(&upstream_payload) {
         return forward_codex_websocket_request_with_candidate(
             context,
             candidate,
@@ -4398,22 +4678,25 @@ async fn forward_codex_request_with_candidate(
     let serialized = serde_json::to_vec(&upstream_payload)
         .map_err(|error| format!("序列化上游请求失败: {error}"))?;
 
-    let mut request = context
-        .client
-        .post(&upstream_url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", candidate.access_token),
-        )
-        .header("ChatGPT-Account-Id", &candidate.account_id)
-        .header("Accept", "text/event-stream")
-        .header("Content-Type", "application/json")
-        .header("Originator", "codex_cli_rs")
-        .header("Version", version)
-        .header("Session_id", session_id)
-        .header("User-Agent", user_agent)
-        .header("Connection", "Keep-Alive");
-    if uses_responses_lite {
+    let accept = if native_image {
+        "application/json"
+    } else {
+        "text/event-stream"
+    };
+    let mut request = build_codex_upstream_request(
+        context,
+        candidate,
+        &upstream_url,
+        version,
+        user_agent,
+        &session_id,
+        accept,
+    );
+    if native_image {
+        // Native Images calls carry the turn id so upstream can tie the image
+        // generation to the same Codex turn as the surrounding session.
+        request = request.header("x-codex-image-turn-id", &session_id);
+    } else if uses_responses_lite {
         request = request.header(RESPONSES_LITE_HEADER, "true");
     }
 
@@ -4871,6 +5154,7 @@ fn account_to_proxy_candidate_at(account: StoredAccount, now: i64) -> Option<Pro
     Some(ProxyCandidate {
         id: account.id,
         label: account.label,
+        source_kind: account.source_kind.clone(),
         account_key,
         account_id: extracted.account_id,
         access_token: extracted.access_token,
@@ -5118,6 +5402,7 @@ fn proxy_candidate_with_auth_json(
     Ok(ProxyCandidate {
         id: candidate.id.clone(),
         label: candidate.label.clone(),
+        source_kind: candidate.source_kind.clone(),
         account_key: candidate.account_key.clone(),
         account_id: extracted.account_id,
         access_token: extracted.access_token,
@@ -6536,6 +6821,51 @@ fn build_image_streaming_response(
             }
         }
 
+        yield Ok::<Bytes, Infallible>(Bytes::from_static(SSE_DONE.as_bytes()));
+    };
+
+    let mut response = Response::builder().status(StatusCode::OK);
+    for (name, value) in &upstream_headers {
+        if should_forward_response_header(name.as_str()) {
+            response = response.header(name, value);
+        }
+    }
+
+    response
+        .header("content-type", "text/event-stream; charset=utf-8")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(output))
+        .unwrap_or_else(|_| json_error_response(StatusCode::BAD_GATEWAY, "构建图片流式响应失败"))
+}
+
+// Codex's native Images API returns JSON, not Responses SSE. Preserve the
+// downstream streaming contract with one final event, without inventing previews.
+fn build_native_image_streaming_response(
+    upstream: CodexUpstreamResponse,
+    usage_storage: ProxyStorageContext,
+    usage_metadata: ApiProxyUsageMetadata,
+) -> Response<Body> {
+    let upstream_headers = upstream.headers().clone();
+    let output = stream! {
+        let image = match upstream.into_bytes().await {
+            Ok((_, body)) => parse_native_image_response(&body),
+            Err(error) => Err(format!("读取 Codex 图片响应失败: {error}")),
+        };
+        match image {
+            Ok(image) => {
+                record_api_proxy_tokens_from_response(&usage_storage, &usage_metadata, &image)
+                    .await;
+                yield Ok::<Bytes, Infallible>(sse_data_chunk(&json!({
+                    "type": "image_generation.completed",
+                    "image": image,
+                })));
+            }
+            Err(message) => {
+                yield Ok::<Bytes, Infallible>(sse_data_chunk(&json!({
+                    "error": { "message": message }
+                })));
+            }
+        }
         yield Ok::<Bytes, Infallible>(Bytes::from_static(SSE_DONE.as_bytes()));
     };
 
@@ -7986,6 +8316,7 @@ fn parse_proxy_request_body_limit_mib(value: Option<&str>) -> Option<usize> {
 mod tests {
     use super::account_to_proxy_candidate;
     use super::account_to_proxy_candidate_at;
+    use super::all_candidates_are_chatgpt;
     use super::api_proxy_disabled_model_set;
     use super::api_proxy_requested_models_from_payload;
     use super::api_proxy_usage_bucket_seconds;
@@ -7997,6 +8328,8 @@ mod tests {
     use super::apply_api_proxy_default_service_tier;
     use super::build_api_proxy_usage_stats;
     use super::build_chat_streaming_response;
+    use super::build_native_image_streaming_response;
+    use super::codex_upstream_header_pairs;
     use super::convert_anthropic_messages_request_to_codex;
     use super::convert_completed_response_to_anthropic_message;
     use super::convert_completed_response_to_chat_completion;
@@ -8016,6 +8349,7 @@ mod tests {
     use super::is_responses_terminal_event;
     use super::list_api_proxy_keys_with_storage;
     use super::map_client_model_to_upstream;
+    use super::native_image_payload;
     use super::new_proxy_storage_context;
     use super::normalize_api_proxy_config_model_name;
     use super::normalize_openai_responses_request;
@@ -8023,7 +8357,9 @@ mod tests {
     use super::now_unix_seconds;
     use super::order_proxy_candidates_for_request;
     use super::parse_http_proxy_config;
+    use super::parse_native_image_response;
     use super::parse_proxy_request_body_limit_mib;
+    use super::proxy_candidate_with_auth_json;
     use super::prune_api_proxy_usage_events;
     use super::regenerate_api_proxy_key_with_runtime;
     use super::request_session_affinity_key;
@@ -8038,6 +8374,7 @@ mod tests {
     use super::translate_sse_event_to_chat_chunk;
     use super::translate_sse_event_to_image_chunk;
     use super::update_api_proxy_key_with_runtime;
+    use super::validate_native_image_response;
     use super::websocket_target_host_port;
     use super::AnthropicStreamState;
     use super::ApiProxyUsageEvent;
@@ -8045,6 +8382,7 @@ mod tests {
     use super::ChatStreamState;
     use super::CodexUpstreamResponse;
     use super::ImageMultipartRequest;
+    use super::ImageTransportKind;
     use super::ProxyCandidate;
     use super::ProxyLoadBalanceConfig;
     use super::ProxyStorageContext;
@@ -8052,6 +8390,7 @@ mod tests {
     use super::API_PROXY_USAGE_RANGE_1H_SECONDS;
     use super::API_PROXY_USAGE_RETENTION_SECONDS;
     use super::DEFAULT_PROXY_REQUEST_BODY_LIMIT_BYTES;
+    use crate::models::AccountSourceKind;
     use crate::models::ApiProxyKey;
     use crate::models::ApiProxyLoadBalanceMode;
     use crate::models::AppSettings;
@@ -8099,6 +8438,7 @@ mod tests {
         ProxyCandidate {
             id: account_key.to_string(),
             label: label.to_string(),
+            source_kind: AccountSourceKind::Chatgpt,
             account_key: account_key.to_string(),
             account_id: account_key.to_string(),
             access_token: "token".to_string(),
@@ -11117,6 +11457,280 @@ data: {"type":"response.completed","response":{"id":"resp_123","created_at":1,"m
         ))
         .await;
         assert!(body.contains("上游流在终态事件前结束"), "{body}");
+        assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
+    }
+
+    // ---- PR4: ChatGPT native image transport ----
+
+    fn native_generation_payload() -> Value {
+        json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "reasoning": { "effort": "medium" },
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Draw a blue circle" }],
+            }],
+            "tools": [{
+                "type": "image_generation",
+                "model": "gpt-image-2",
+                "action": "generate",
+                "quality": "high",
+                "size": "1024x1024",
+                "background": "transparent",
+                "partial_images": 2,
+            }],
+        })
+    }
+
+    #[test]
+    fn native_image_payload_generation_uses_image_model_without_controller_options() {
+        assert_eq!(
+            native_image_payload(&native_generation_payload()).expect("native generation"),
+            json!({
+                "model": "gpt-image-2",
+                "prompt": "Draw a blue circle",
+                "n": 1,
+                "quality": "high",
+                "size": "1024x1024",
+                "background": "transparent",
+            })
+        );
+
+        // End-to-end through the existing OpenAI image conversion: the
+        // controller model and Responses-only options never reach the native body.
+        let converted = convert_openai_image_generation_request_to_codex(&json!({
+            "model": "gpt-image-2",
+            "prompt": "Draw a blue circle",
+            "quality": "high",
+            "size": "1024x1024",
+        }))
+        .expect("convert generation request");
+        let native = native_image_payload(&converted.upstream_payload).expect("native body");
+        assert_eq!(native["model"], "gpt-image-2");
+        assert_eq!(native["prompt"], "Draw a blue circle");
+        assert_eq!(native["n"], 1);
+        assert_eq!(converted.image_count, 1);
+    }
+
+    #[test]
+    fn native_image_payload_edit_preserves_ordered_images_and_mask_instructions() {
+        let edit_request = ImageMultipartRequest {
+            fields: json!({ "prompt": "Change the hat" })
+                .as_object()
+                .expect("fields object")
+                .clone(),
+            images: vec![
+                json!({ "type": "input_image", "image_url": "data:image/png;base64,source" }),
+                json!({ "type": "input_image", "file_id": "file-reference" }),
+            ],
+            mask: Some(json!({ "type": "input_image", "image_url": "data:image/png;base64,mask" })),
+        };
+        let converted = convert_openai_image_edit_request_to_codex(&edit_request, false)
+            .expect("convert edit request");
+        let native = native_image_payload(&converted.upstream_payload).expect("native edit body");
+        assert_eq!(
+            native["prompt"],
+            "Change the hat\n\nUse the following image as the edit mask for the preceding image. Treat the light/white area as the region to edit and keep the dark/black area unchanged."
+        );
+        assert_eq!(
+            native["images"],
+            json!([
+                { "image_url": "data:image/png;base64,source" },
+                { "file_id": "file-reference" },
+                { "image_url": "data:image/png;base64,mask" },
+            ])
+        );
+        assert_eq!(native["n"], 1);
+    }
+
+    #[test]
+    fn native_image_payload_rejects_unsupported_options() {
+        for (field, value) in [
+            ("output_format", json!("jpeg")),
+            ("output_format", json!("webp")),
+            ("output_compression", json!(80)),
+            ("input_fidelity", json!("low")),
+        ] {
+            let mut payload = native_generation_payload();
+            payload["tools"][0][field] = value;
+            let error = native_image_payload(&payload).expect_err("unsupported native option");
+            assert!(error.contains(field), "{error}");
+        }
+
+        let mut payload = native_generation_payload();
+        payload["tools"][0]["output_format"] = json!("png");
+        payload["tools"][0]["input_fidelity"] = json!("high");
+        let request = native_image_payload(&payload).expect("native defaults are accepted");
+        assert!(request.get("output_format").is_none());
+        assert!(request.get("input_fidelity").is_none());
+    }
+
+    #[test]
+    fn native_image_payload_rejects_missing_or_ambiguous_image_references() {
+        for image in [
+            json!({ "type": "input_image" }),
+            json!({ "type": "input_image", "image_url": " " }),
+            json!({
+                "type": "input_image",
+                "image_url": "data:image/png;base64,a",
+                "file_id": "file-a",
+            }),
+        ] {
+            let mut payload = native_generation_payload();
+            payload["input"][0]["content"]
+                .as_array_mut()
+                .expect("content array")
+                .push(image);
+            assert!(native_image_payload(&payload).is_err());
+        }
+    }
+
+    #[test]
+    fn native_image_response_validation_requires_nonempty_image_data() {
+        for response in [
+            json!({}),
+            json!({ "data": [] }),
+            json!({ "data": [{}] }),
+            json!({ "data": [{ "b64_json": "" }] }),
+            json!({ "data": [{ "b64_json": "valid" }, { "b64_json": " " }] }),
+        ] {
+            assert!(validate_native_image_response(&response).is_err());
+        }
+        assert!(validate_native_image_response(&json!({
+            "created": 1,
+            "data": [
+                { "b64_json": "image-one", "generation_id": "gen-one" },
+                { "b64_json": "image-two" },
+            ],
+            "usage": { "total_tokens": 42 },
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn native_image_response_parse_maps_upstream_errors() {
+        let error = parse_native_image_response(br#"{"error":{"message":"image denied"}}"#)
+            .expect_err("error message");
+        assert!(error.contains("image denied"));
+        let error =
+            parse_native_image_response(br#"{"detail":"bad detail"}"#).expect_err("detail message");
+        assert!(error.contains("bad detail"));
+        assert!(parse_native_image_response(b"not json").is_err());
+        let parsed =
+            parse_native_image_response(br#"{"created":1,"data":[{"b64_json":"image-one"}]}"#)
+                .expect("valid native response");
+        assert_eq!(parsed["data"][0]["b64_json"], "image-one");
+    }
+
+    #[test]
+    fn image_transport_kind_maps_routes_and_endpoints() {
+        assert_eq!(
+            ImageTransportKind::from_route("/v1/images/generations"),
+            ImageTransportKind::Generation
+        );
+        assert_eq!(
+            ImageTransportKind::from_route("/v1/images/edits"),
+            ImageTransportKind::Edit
+        );
+        assert_eq!(
+            ImageTransportKind::from_route("/v1/images/variations"),
+            ImageTransportKind::Edit
+        );
+        assert_eq!(
+            ImageTransportKind::Generation.endpoint_path(),
+            "images/generations"
+        );
+        assert_eq!(ImageTransportKind::Edit.endpoint_path(), "images/edits");
+    }
+
+    #[test]
+    fn native_image_headers_match_regular_request_except_accept() {
+        let candidate = proxy_candidate("primary", "acct", None, None, false);
+        let regular = codex_upstream_header_pairs(
+            &candidate,
+            "0.159.0",
+            "codex_cli_rs/0.159.0",
+            "session-1",
+            "text/event-stream",
+        );
+        let native = codex_upstream_header_pairs(
+            &candidate,
+            "0.159.0",
+            "codex_cli_rs/0.159.0",
+            "session-1",
+            "application/json",
+        );
+        assert_eq!(regular.len(), native.len());
+        for ((name, regular_value), (native_name, native_value)) in
+            regular.iter().zip(native.iter())
+        {
+            assert_eq!(name, native_name);
+            if *name == "Accept" {
+                assert_eq!(regular_value, "text/event-stream");
+                assert_eq!(native_value, "application/json");
+            } else {
+                assert_eq!(regular_value, native_value, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_images_guard_rejects_mixed_candidate_pools() {
+        let chatgpt = proxy_candidate("chatgpt", "acct-a", None, None, false);
+        assert!(all_candidates_are_chatgpt(&[chatgpt.clone()]));
+
+        let mut relay = proxy_candidate("relay", "acct-b", None, None, false);
+        relay.source_kind = AccountSourceKind::Relay;
+        assert!(!all_candidates_are_chatgpt(&[chatgpt, relay]));
+    }
+
+    #[test]
+    fn proxy_candidate_keeps_account_source_kind() {
+        let account = stored_proxy_account("acct-kind", "team", None);
+        let candidate = account_to_proxy_candidate_at(account, now_unix_seconds())
+            .expect("ChatGPT account becomes a proxy candidate");
+        assert!(matches!(candidate.source_kind, AccountSourceKind::Chatgpt));
+
+        let refreshed = proxy_candidate_with_auth_json(&candidate, candidate.auth_json.clone())
+            .expect("refresh rebuild keeps candidate usable");
+        assert!(matches!(refreshed.source_kind, AccountSourceKind::Chatgpt));
+    }
+
+    #[tokio::test]
+    async fn native_image_streaming_response_emits_single_completed_and_done() {
+        let image_body = json!({
+            "created": 1,
+            "data": [{ "b64_json": "aW1n" }],
+        })
+        .to_string();
+        let response = build_native_image_streaming_response(
+            chat_stream_upstream(vec![image_body.as_str()]),
+            chat_stream_test_storage(),
+            chat_stream_test_metadata(),
+        );
+        let body = collect_chat_stream_body(response).await;
+        assert_eq!(
+            body.matches("\"type\":\"image_generation.completed\"")
+                .count(),
+            1,
+            "{body}"
+        );
+        assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
+        assert!(!body.contains("\"error\""), "{body}");
+    }
+
+    #[tokio::test]
+    async fn native_image_streaming_response_reports_upstream_error() {
+        let error_body = json!({ "error": { "message": "image quota" } }).to_string();
+        let response = build_native_image_streaming_response(
+            chat_stream_upstream(vec![error_body.as_str()]),
+            chat_stream_test_storage(),
+            chat_stream_test_metadata(),
+        );
+        let body = collect_chat_stream_body(response).await;
+        assert!(body.contains("image quota"), "{body}");
         assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
     }
 }

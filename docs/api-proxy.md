@@ -253,8 +253,12 @@ Tauri 命令入口在：
 
 行为：
 
-- `generations` 会转成 Codex image generation tool
-- `edits` 和 `variations` 会把上传图片转成 `input_image`
+- ChatGPT 登录账号：`generations` 直接调用 Codex 原生 `images/generations`，`edits` / `variations` 调用 `images/edits`；顶层模型为上传请求里的图片模型（当前只支持 `gpt-image-2`），不再使用已退役的 `gpt-5.5` 控制模型或 Responses Lite 工具路径
+- Relay/API 账号：继续走 Responses `image_generation` 工具路径（本轮未随 native 一起改造；Relay 候选当前也不会进入图片候选池，见下文限制）
+- `edits` 和 `variations` 会把上传图片转成原生图片引用（`image_url` 或 `file_id`，每张图只允许其一）；`mask` 仍以“附加遮罩图片 + 提示词”的方式传入，并非原生 mask 参数
+- ChatGPT 原生接口返回完整 JSON（`data[].b64_json`）；下游 `stream:true` 时只合成一条 `image_generation.completed`（`image` 为完整原生响应）和一条 `[DONE]`，不提供 `partial_images` 预览
+- ChatGPT 路径只支持 PNG 输出：`output_format` 只能省略或为 `png`，`output_compression` / `compression` 会被明确拒绝，`input_fidelity` 只能省略或为 `high`；这些参数校验发生在账号选择之前，返回 400 且不会冷却账号或切换候选
+- `n` 由代理逐张请求（每张固定 `n=1`），任一张失败则整个请求返回错误，不会返回半份 `data`；账号刷新、失败切换、图片模型权限与用量统计沿用现有逻辑
 - 返回值使用 OpenAI 图片接口常见的 `b64_json`
 
 ## 7. 鉴权方式
@@ -692,6 +696,8 @@ Cloudflared 不参与：
 - `/v1/responses` 的流式是近似透传，不额外做深层语义改写
 - GPT-6/GPT-5.6 Responses Lite 不接收 hosted `web_search`、`web_search_preview`、`image_generation` 工具；这类请求会明确拒绝，客户端扩展工具仍会透传
 - 远程图片 URL 会替换为占位文本，Lite 请求不会发送图片 `detail`
+- 图片原生传输仅支持全部为 ChatGPT 账号的候选池；Relay/API 账号暂不支持图片，混合候选池会明确返回错误
+- ChatGPT 原生图片接口只支持 PNG、`input_fidelity` 省略或 `high`，不接受 `output_compression`/`compression`；`n>1` 逐张生成且失败不返回半份结果
 - `/v1/chat/completions` 的流式终止语义已覆盖 `completed/done/incomplete/failed/cancelled/error` 与“未终止流补 error”；非流式仍从完整 SSE 中提取 `response.completed`，遇到 `incomplete`/`failed` 会返回错误而非静默成功
 - 核心目标是把最常用的聊天链路稳定打通
 
