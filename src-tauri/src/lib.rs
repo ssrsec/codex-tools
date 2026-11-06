@@ -1617,12 +1617,24 @@ async fn switch_account_and_launch(
 
         let current_account_key = auth::current_auth_account_key();
         let current_variant_key = auth::current_auth_variant_key();
-        if should_noop_switch_account(
-            &store,
-            &account,
-            current_account_key.as_deref(),
-            current_variant_key.as_deref(),
-        ) {
+        let is_noop_switch = profile_files::current_config_matches_account(&account)
+            && should_noop_switch_account(
+                &store,
+                &account,
+                current_account_key.as_deref(),
+                current_variant_key.as_deref(),
+            );
+        // 顺序约束：真正的 no-op 必须在这里返回，早于 stop_desktop_app_if_running /
+        // capture / prepare_project_state / token 刷新，保证“点当前账号”零副作用。
+        #[cfg(target_os = "macos")]
+        let should_relaunch_noop = should_relaunch_noop_switch(
+            is_noop_switch,
+            should_launch_codex,
+            desktop_app_is_running(),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let should_relaunch_noop = false;
+        if should_return_noop_switch(is_noop_switch, should_relaunch_noop) {
             let mut result = noop_switch_account_result(&account);
             result.provider_sync_error = provider_sync::sync_current_provider(None)
                 .err()
@@ -1645,21 +1657,40 @@ async fn switch_account_and_launch(
             );
         }
 
-        if let Some(prepared) = desktop_state::prepare_project_state(
-            &app_paths::app_data_dir(&app)?,
-            &account.auth_json,
-        ) {
-            log::info!(
-                "切换前已备份 ChatGPT 项目状态: {}（目标账号快照 {}，项目清单同步: {}，项目数: {}）",
-                prepared.backup_path.display(),
-                prepared
-                    .target_hash
-                    .as_deref()
-                    .map(|hash| &hash[..hash.len().min(12)])
-                    .unwrap_or("unknown"),
-                prepared.seeded,
-                prepared.seeded_projects
-            );
+        // P0-3/W1-M1：在 prepare / 目标 token 刷新之前，把当前账号在桌面端轮换后的
+        // 授权快照落盘。独立一次 store 锁 load→capture→save；切换是低频动作，成本可忽略。
+        if should_capture_before_switch(store.settings.active_account_id.as_deref(), &id) {
+            let store_path =
+                store::account_store_path_from_data_dir(&app_paths::app_data_dir(&app)?);
+            let _guard = state.store_lock.lock().await;
+            let mut latest_store = store::load_store(&app)?;
+            if account_service::capture_current_auth_for_active_profile(
+                &store_path,
+                &mut latest_store,
+            ) {
+                store::save_store(&app, &latest_store)?;
+            }
+        }
+
+        // noop 但需要重新拉起应用时跳过项目状态准备（同账号无项目归属迁移），
+        // 避免 10 份备份环被同内容反复挤占；provider_sync 仍保留。
+        if !should_relaunch_noop {
+            if let Some(prepared) = desktop_state::prepare_project_state(
+                &app_paths::app_data_dir(&app)?,
+                &account.auth_json,
+            ) {
+                log::info!(
+                    "切换前已备份 ChatGPT 项目状态: {}（目标账号快照 {}，项目清单同步: {}，项目数: {}）",
+                    prepared.backup_path.display(),
+                    prepared
+                        .target_hash
+                        .as_deref()
+                        .map(|hash| &hash[..hash.len().min(12)])
+                        .unwrap_or("unknown"),
+                    prepared.seeded,
+                    prepared.seeded_projects
+                );
+            }
         }
 
         if matches!(account.source_kind, models::AccountSourceKind::Chatgpt) {
@@ -1975,6 +2006,26 @@ async fn switch_account_and_launch(
         editor_restart_error,
         provider_sync_error,
     })
+}
+
+/// no-op 是否应当直接返回（不 stop / 不 capture / 不 prepare / 不刷新）。
+fn should_return_noop_switch(is_noop_switch: bool, should_relaunch_noop: bool) -> bool {
+    is_noop_switch && !should_relaunch_noop
+}
+
+/// macOS：no-op（配置与身份都匹配）但应用没在运行时，需要继续走完整切换把应用拉起。
+/// 非 macOS 不启用（无可靠进程检测）。
+fn should_relaunch_noop_switch(
+    is_noop_switch: bool,
+    should_launch_codex: bool,
+    app_running: bool,
+) -> bool {
+    is_noop_switch && should_launch_codex && !app_running
+}
+
+/// 目标账号不是当前活动账号时，才需要先把 live auth 的轮换快照写回旧账号。
+fn should_capture_before_switch(active_account_id: Option<&str>, target_account_id: &str) -> bool {
+    active_account_id.is_some_and(|active_id| active_id != target_account_id)
 }
 
 fn should_noop_switch_account(
@@ -2482,11 +2533,7 @@ fn macos_running_desktop_process_ids() -> Result<HashSet<sysinfo::Pid>, String> 
 #[cfg(all(target_os = "macos", not(test)))]
 fn request_macos_desktop_quit() -> bool {
     const QUIT_SCRIPT: &str = "tell application id \"com.openai.codex\" to quit";
-    let mut child = match Command::new("osascript")
-        .arg("-e")
-        .arg(QUIT_SCRIPT)
-        .spawn()
-    {
+    let mut child = match Command::new("osascript").arg("-e").arg(QUIT_SCRIPT).spawn() {
         Ok(child) => child,
         Err(error) => {
             log::warn!("请求 ChatGPT 退出失败（无法启动 osascript）: {error}");
@@ -2989,4 +3036,59 @@ pub fn try_run_cli_from_env() -> bool {
 
 pub fn run_cli_from_env() -> ! {
     command_line::run_from_env_or_exit()
+}
+
+#[cfg(test)]
+mod pr1a_noop_tests {
+    use super::should_capture_before_switch;
+    use super::should_relaunch_noop_switch;
+    use super::should_return_noop_switch;
+
+    #[test]
+    fn noop_return_precedes_any_side_effect() {
+        // 顺序断言（逻辑层）：真 no-op 时只应返回，不应进入 stop/capture/prepare/刷新。
+        fn gate_trace(is_noop_switch: bool, should_relaunch_noop: bool) -> Vec<&'static str> {
+            let mut trace = Vec::new();
+            if should_return_noop_switch(is_noop_switch, should_relaunch_noop) {
+                trace.push("return_noop");
+                return trace;
+            }
+            trace.push("stop_desktop_app");
+            trace.push("capture_current_auth");
+            trace.push("prepare_project_state");
+            trace.push("refresh_target_token");
+            trace
+        }
+
+        assert_eq!(gate_trace(true, false), vec!["return_noop"]);
+        assert!(gate_trace(true, true).contains(&"stop_desktop_app"));
+        assert!(gate_trace(false, false).contains(&"stop_desktop_app"));
+    }
+
+    #[test]
+    fn relaunch_noop_requires_macos_launch_and_stopped_app() {
+        assert!(should_relaunch_noop_switch(true, true, false));
+        assert!(!should_relaunch_noop_switch(true, true, true));
+        assert!(!should_relaunch_noop_switch(true, false, false));
+        assert!(!should_relaunch_noop_switch(false, true, false));
+        assert!(!should_relaunch_noop_switch(false, false, true));
+    }
+
+    #[test]
+    fn return_noop_only_when_switch_is_noop_and_app_should_not_relaunch() {
+        assert!(should_return_noop_switch(true, false));
+        assert!(!should_return_noop_switch(true, true));
+        assert!(!should_return_noop_switch(false, false));
+        assert!(!should_return_noop_switch(false, true));
+    }
+
+    #[test]
+    fn capture_before_switch_only_for_a_different_target_account() {
+        assert!(should_capture_before_switch(Some("account-a"), "account-b"));
+        assert!(!should_capture_before_switch(
+            Some("account-a"),
+            "account-a"
+        ));
+        assert!(!should_capture_before_switch(None, "account-b"));
+    }
 }
